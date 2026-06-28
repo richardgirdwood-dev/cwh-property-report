@@ -27,12 +27,11 @@ def _sig_img_tag():
         return ""
 
 HTML_SIGNATURE = """\
-<br><br>
-<p style="margin:0;font-family:Calibri,Arial,sans-serif;font-size:10pt;">Kind regards,</p>
+<p style="margin:0;font-family:Aptos,Calibri,Arial,sans-serif;font-size:10pt;">Kind regards,</p>
 <br>
-<p style="margin:0;font-family:Calibri,Arial,sans-serif;font-size:10pt;">Richard</p>
+<p style="margin:0;font-family:Aptos,Calibri,Arial,sans-serif;font-size:10pt;">Richard</p>
 <br>
-<p style="margin:0;font-family:Calibri,Arial,sans-serif;font-size:10pt;color:#1F497D;">
+<p style="margin:0;font-family:Aptos,Calibri,Arial,sans-serif;font-size:10pt;color:#1F497D;">
   <b>Richard Girdwood MRICS</b><br>
   <b>Partner &amp; Chartered Surveyor</b><br>
   <b>Cambridgeshire, Rutland, South Lincs and Northamptonshire office</b>
@@ -40,7 +39,7 @@ HTML_SIGNATURE = """\
 <br>
 {logo}
 <br>
-<p style="margin:0;font-family:Calibri,Arial,sans-serif;font-size:10pt;color:#1F497D;">
+<p style="margin:0;font-family:Aptos,Calibri,Arial,sans-serif;font-size:10pt;color:#1F497D;">
   Unit One, Hill Court<br>
   Turnpike Close<br>
   Grantham<br>
@@ -48,13 +47,13 @@ HTML_SIGNATURE = """\
   NG31 7XY
 </p>
 <br>
-<p style="margin:0;font-family:Calibri,Arial,sans-serif;font-size:10pt;color:#1F497D;">
+<p style="margin:0;font-family:Aptos,Calibri,Arial,sans-serif;font-size:10pt;color:#1F497D;">
   Tel: 01476 584190<br>
   Mob: 07766 140112<br>
   Fax: 01476 584191
 </p>
 <br>
-<p style="margin:0;font-family:Calibri,Arial,sans-serif;font-size:10pt;">
+<p style="margin:0;font-family:Aptos,Calibri,Arial,sans-serif;font-size:10pt;">
   <a href="http://www.cwhsurveyors.co.uk" style="color:#C00000;font-size:16pt;font-weight:bold;text-decoration:none;">www.cwhsurveyors.co.uk</a>
 </p>
 """
@@ -72,14 +71,15 @@ POSTCODE_RE   = re.compile(r'^[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}$', re.IGNOREC
 POPUP_RE      = re.compile(r'new submission from popup', re.IGNORECASE)
 NAME_RE       = re.compile(r'Dear\s+([A-Za-z\-]+)', re.IGNORECASE)
 
-def _p(text):
+def _p(text, last=False):
     """Wrap text in a simple HTML paragraph."""
-    return f'<p style="margin:0 0 12px 0;font-family:Calibri,Arial,sans-serif;font-size:11pt;">{text}</p>'
+    margin = "0" if last else "0 0 12px 0"
+    return f'<p style="margin:{margin};font-family:Aptos,Calibri,Arial,sans-serif;font-size:11pt;">{text}</p>'
 
 def _ol(*items):
     """Ordered list of items."""
     lis = "".join(f"<li>{i}</li>" for i in items)
-    return f'<ol style="margin:0 0 12px 0;font-family:Calibri,Arial,sans-serif;font-size:11pt;">{lis}</ol>'
+    return f'<ol style="margin:0 0 12px 0;font-family:Aptos,Calibri,Arial,sans-serif;font-size:11pt;">{lis}</ol>'
 
 L2_HTML = """\
 {note_para}
@@ -130,7 +130,7 @@ def build_html_body(name, address, fee, availability, survey_type, notes):
         "Who the report should be addressed to (jointly with a partner or spouse if applicable)",
         "Your current home address",
     )
-    p_close     = p("Feel free to contact me at any time via phone or email if there is anything you would like to discuss further.")
+    p_close     = p("Feel free to contact me at any time via phone or email if there is anything you would like to discuss further.", last=True)
     p_reviews   = p('Our Google reviews: <a href="https://tinyurl.com/CWH-Surveyors">https://tinyurl.com/CWH-Surveyors</a>')
     p_fee_bold  = p(f"The fee for the {'Level 2 Home Survey' if survey_type == 'l2' else 'Level 3 Building Survey'}, excluding valuation, will be <b>&pound;{fee} + VAT</b>.")
 
