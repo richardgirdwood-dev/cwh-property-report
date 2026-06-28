@@ -352,7 +352,7 @@ OVERPASS_HEADERS = {
 def fetch_rail_stations(lat, lng):
     """Returns up to 4 nearest stations with distances."""
     try:
-        query = f"[out:json];node[railway=station](around:20000,{lat},{lng});out;"
+        query = f"[out:json][timeout:30];node[railway=station](around:20000,{lat},{lng});out;"
         r = requests.post("https://overpass-api.de/api/interpreter",
                           data={"data": query}, headers=OVERPASS_HEADERS, timeout=25)
         r.raise_for_status()
@@ -368,48 +368,61 @@ def fetch_rail_stations(lat, lng):
     except Exception:
         return []
 
+def _wgs84_to_osgb(lat, lon):
+    """Approximate WGS84 -> OSGB36 easting/northing (accurate to ~1 m for England)."""
+    a, b = 6378137.0, 6356752.3142
+    F0 = 0.9996012717
+    lat0, lon0 = math.radians(49), math.radians(-2)
+    N0, E0 = -100000, 400000
+    e2 = 1 - (b / a) ** 2
+    n = (a - b) / (a + b)
+    la = math.radians(lat); lo = math.radians(lon)
+    sinla = math.sin(la); cosla = math.cos(la)
+    nu  = a * F0 / math.sqrt(1 - e2 * sinla ** 2)
+    rho = a * F0 * (1 - e2) / (1 - e2 * sinla ** 2) ** 1.5
+    eta2 = nu / rho - 1
+    M = b * F0 * (
+        ((1 + n + 5/4*n**2 + 5/4*n**3) * (la - lat0))
+        - ((3*n + 3*n**2 + 21/8*n**3) * math.sin(la - lat0) * math.cos(la + lat0))
+        + ((15/8*n**2 + 15/8*n**3) * math.sin(2*(la - lat0)) * math.cos(2*(la + lat0)))
+        - (35/24*n**3 * math.sin(3*(la - lat0)) * math.cos(3*(la + lat0)))
+    )
+    I    = M + N0
+    II   = nu / 2 * sinla * cosla
+    III  = nu / 24 * sinla * cosla ** 3 * (5 - math.tan(la) ** 2 + 9 * eta2)
+    IIIA = nu / 720 * sinla * cosla ** 5 * (61 - 58 * math.tan(la) ** 2 + math.tan(la) ** 4)
+    IV   = nu * cosla
+    V    = nu / 6 * cosla ** 3 * (nu / rho - math.tan(la) ** 2)
+    VI   = nu / 120 * cosla ** 5 * (5 - 18*math.tan(la)**2 + math.tan(la)**4 + 14*eta2 - 58*math.tan(la)**2*eta2)
+    dlon = lo - lon0
+    N = I  + II  * dlon ** 2 + III  * dlon ** 4 + IIIA * dlon ** 6
+    E = E0 + IV  * dlon      + V    * dlon ** 3  + VI   * dlon ** 5
+    return E, N
+
 def fetch_soil(lat, lng):
-    """Returns soil type info from LandIS Soilscapes."""
+    """Returns soil type info from LandIS Soilscapes (Cranfield University)."""
     try:
-        url = (f"https://www.landis.org.uk/arcgis/rest/services/UKSoilObservatory/"
-               f"Soilscapes_Cranfield/MapServer/0/query"
-               f"?geometry={lng},{lat}&geometryType=esriGeometryPoint&inSR=4326"
-               f"&outFields=*&returnGeometry=false&f=json")
-        r = requests.get(url, timeout=15, headers=HEADERS)
-        features = r.json().get("features", [])
-        if not features:
+        E, N = _wgs84_to_osgb(lat, lng)
+        url = f"https://www.landis.org.uk/soilscapes/get_data_json.php?latlong={E:.0f},{N:.0f}"
+        r = requests.get(url, timeout=15, headers={
+            **HEADERS,
+            "Referer": "https://www.landis.org.uk/soilscapes/index.cfm",
+        })
+        d = r.json()
+        ssid = d.get("ss_id", "")
+        name = d.get("soilscape", "")
+        if not name:
             return None, None
-        attrs = features[0]["attributes"]
-        ssid = None
-        soilscape = attrs.get("SOILSCAPE", "")
-        detail_url = attrs.get("URL", "")
-        ssid_match = re.search(r"ssid=(\d+)", detail_url)
-        if ssid_match:
-            ssid = ssid_match.group(1)
-            r2 = requests.get(detail_url, timeout=15, headers=HEADERS)
-            soup = BeautifulSoup(r2.text, "html.parser")
-            soil_lines = [l.strip() for l in soup.get_text(separator="\n").split("\n") if l.strip()]
-
-            def soil_after(label, default="N/A"):
-                lbl = label.lower().rstrip(":")
-                for i, ln in enumerate(soil_lines):
-                    if ln.lower().rstrip(":") == lbl and i + 1 < len(soil_lines):
-                        val = soil_lines[i + 1]
-                        # Skip if next line is another label (ends with ":")
-                        return val if not val.endswith(":") else default
-                return default
-
-            return {
-                "name":      soilscape,
-                "ssid":      ssid,
-                "texture":   soil_after("Texture:"),
-                "drainage":  soil_after("Drainage:"),
-                "fertility": soil_after("Fertility:"),
-                "carbon":    soil_after("Topsoil Carbon:"),
-                "landcover": soil_after("Land Cover:"),
-                "water":     soil_after("Water Protection Issues:"),
-            }, detail_url
-        return {"name": soilscape, "ssid": ssid}, detail_url
+        return {
+            "name":      name,
+            "ssid":      ssid,
+            "texture":   d.get("texture",          "N/A"),
+            "drainage":  d.get("drainage",          "N/A"),
+            "fertility": d.get("fertility",         "N/A"),
+            "carbon":    d.get("carbon",            "N/A"),
+            "landcover": d.get("landcover",         "N/A"),
+            "water":     d.get("water_protection",  "N/A"),
+        }, "https://www.landis.org.uk/soilscapes/"
     except Exception:
         return None, None
 
@@ -418,7 +431,7 @@ SHOP_TYPES = {"supermarket", "convenience", "general", "department_store", "mall
 def fetch_schools_and_amenities(lat, lng):
     """Single Overpass query for schools, shops, GPs, and pubs — avoids rate-limit issues."""
     query = (
-        f"[out:json];"
+        f"[out:json][timeout:30];"
         f"("
         f"node[amenity=school](around:3000,{lat},{lng});"
         f"way[amenity=school](around:3000,{lat},{lng});"
