@@ -4,6 +4,7 @@ Generates a Sprift-style PDF environmental report for any UK residential propert
 Usage: generate_report(address, postcode, output_path)
 """
 
+import os
 import re
 import math
 import requests
