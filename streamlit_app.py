@@ -27,9 +27,9 @@ def _sig_img_tag():
         return ""
 
 HTML_SIGNATURE = """\
-<p style="margin:0;font-family:Aptos,Calibri,Arial,sans-serif;font-size:10pt;">Kind regards,</p>
+<p style="margin:0;font-family:Aptos,Calibri,Arial,sans-serif;font-size:11pt;">Kind regards,</p>
 <br>
-<p style="margin:0;font-family:Aptos,Calibri,Arial,sans-serif;font-size:10pt;">Richard</p>
+<p style="margin:0;font-family:Aptos,Calibri,Arial,sans-serif;font-size:11pt;">Richard</p>
 <br>
 <p style="margin:0;font-family:Aptos,Calibri,Arial,sans-serif;font-size:10pt;color:#1F497D;">
   <b>Richard Girdwood MRICS</b><br>
