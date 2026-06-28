@@ -7,9 +7,57 @@ CWH Surveyors LLP — Internal Tools
 import os
 import re
 import json
+import base64
 import tempfile
 import datetime
 import streamlit as st
+
+SIG_IMG_PATH = (
+    r"C:\Users\Richard Girdwood\AppData\Roaming\Microsoft\Signatures"
+    r"\Office (richard.girdwood@cwhsurveyors.co.uk)_files\image001.png"
+)
+
+def _sig_img_tag():
+    """Return an <img> tag with the signature logo embedded as base64."""
+    try:
+        with open(SIG_IMG_PATH, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        return f'<img src="data:image/png;base64,{b64}" width="260" height="47" alt="CWH Surveyors" style="display:block;border:0;">'
+    except Exception:
+        return ""
+
+HTML_SIGNATURE = """\
+<br><br>
+<p style="margin:0;font-family:Calibri,Arial,sans-serif;font-size:10pt;">Kind regards,</p>
+<br>
+<p style="margin:0;font-family:Calibri,Arial,sans-serif;font-size:10pt;">Richard</p>
+<br>
+<p style="margin:0;font-family:Calibri,Arial,sans-serif;font-size:10pt;color:#1F497D;">
+  <b>Richard Girdwood MRICS</b><br>
+  <b>Partner &amp; Chartered Surveyor</b><br>
+  <b>Cambridgeshire, Rutland, South Lincs and Northamptonshire office</b>
+</p>
+<br>
+{logo}
+<br>
+<p style="margin:0;font-family:Calibri,Arial,sans-serif;font-size:10pt;color:#1F497D;">
+  Unit One, Hill Court<br>
+  Turnpike Close<br>
+  Grantham<br>
+  Lincolnshire<br>
+  NG31 7XY
+</p>
+<br>
+<p style="margin:0;font-family:Calibri,Arial,sans-serif;font-size:10pt;color:#1F497D;">
+  Tel: 01476 584190<br>
+  Mob: 07766 140112<br>
+  Fax: 01476 584191
+</p>
+<br>
+<p style="margin:0;font-family:Calibri,Arial,sans-serif;font-size:10pt;">
+  <a href="http://www.cwhsurveyors.co.uk" style="color:#C00000;font-size:16pt;font-weight:bold;text-decoration:none;">www.cwhsurveyors.co.uk</a>
+</p>
+"""
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -24,80 +72,97 @@ POSTCODE_RE   = re.compile(r'^[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}$', re.IGNOREC
 POPUP_RE      = re.compile(r'new submission from popup', re.IGNORECASE)
 NAME_RE       = re.compile(r'Dear\s+([A-Za-z\-]+)', re.IGNORECASE)
 
-SIGNATURE = """\n\nKind regards,\n\nRichard\n\nRichard Girdwood MRICS\nPartner & Chartered Surveyor\nCambridgeshire, Rutland, South Lincs and Northamptonshire office\n\nUnit One, Hill Court\nTurnpike Close\nGrantham\nLincolnshire\nNG31 7XY\n\nTel: 01476 584 190\nwww.cwhsurveyors.co.uk"""
+def _p(text):
+    """Wrap text in a simple HTML paragraph."""
+    return f'<p style="margin:0 0 12px 0;font-family:Calibri,Arial,sans-serif;font-size:11pt;">{text}</p>'
 
-L2_BODY = """\
-Hi {name},
+def _ol(*items):
+    """Ordered list of items."""
+    lis = "".join(f"<li>{i}</li>" for i in items)
+    return f'<ol style="margin:0 0 12px 0;font-family:Calibri,Arial,sans-serif;font-size:11pt;">{lis}</ol>'
 
-Thank you for your enquiry and the opportunity to quote for {address}.
-
-For a property of this age and type, I recommend the Level 2 Home Survey.
-
-In summary, the Level 2 Home Survey covers all key elements of the property, including roof coverings, windows, doors, walls, and the damp proof course. Internally, an inspection of the roof space, where accessible, is conducted, including an assessment of the condition of the timbers and insulation levels. The report then covers all remaining internal elements of the property.
-
-Gardens and grounds are included. A visual inspection of the services is conducted; however, we always recommend that up-to-date test certificates be provided for these. We would also lift any accessible drain covers on site to assess the condition.
-
-Each section is assigned a condition rating (Green, Amber, or Red). Red sections indicate those that require further investigation or pose health and safety concerns. Amber indicates work that is required but not urgent, and Green indicates areas in satisfactory condition with regular maintenance required.
-
-There is also an overview of legal items which your advisors should check as part of the purchase.
-
-The report aims to enable you to make a fully informed decision about your purchase and to conduct any necessary investigations before exchanging contracts.
-
-Upon completion of the report, we would be happy to answer any further questions or discuss any particular concerns to provide more information if necessary.
-
-The fee for the Level 2 Home Survey, excluding valuation, will be \xa3{fee} + VAT.
-
-We have availability from {availability}. Following the inspection, we will issue the completed report within 3-5 working days. If there are any cancellations, we would consider bringing this date forward.
-
-If you are happy to proceed on this basis, could you please confirm the following:
-
-1. Who the report should be addressed to (jointly with a partner or spouse if applicable)
-2. Your current home address
-
-We will then issue the Terms and Conditions and an invoice via email. Payment can be made via bank transfer, and our bank details will be provided on the invoice.
-
-Further information and a sample report can be found on our website:
-https://www.cwhsurveyors.co.uk/services/home-survey-reports/
-
-Our Google reviews:
-https://tinyurl.com/CWH-Surveyors
-
-Feel free to contact me at any time via phone or email if there is anything you would like to discuss further.\
+L2_HTML = """\
+{note_para}
+{p_recommend}
+{p_l2_desc}
+{p_gardens}
+{p_ratings}
+{p_legal}
+{p_aim}
+{p_followup}
+{p_fee}
+{p_avail_l2}
+{p_proceed}
+{ol_confirm}
+{p_terms_l2}
+{p_website}
+{p_reviews}
+{p_close}
 """
 
-L3_BODY = """\
-Hi {name},
-
-Thank you for your enquiry and the opportunity to quote for {address}.
-
-The Level 3 Building Survey will be the best option for a property of this age and type.
-
-In summary, the Level 3 Survey encompasses all key elements of the property, including the roof covering, windows, doors, walls, and the damp proof course. Internally, an inspection of the roof space, where accessible, is conducted, including an assessment of the condition of the timbers and insulation levels. The report then covers all remaining internal elements of the property.
-
-Gardens and grounds are included. A visual inspection of the services is conducted; however, we always recommend that up-to-date test certificates are provided for these. We would also lift any accessible drain covers on site to assess the condition.
-
-Each section is assigned a condition rating (Green, Amber, or Red). Red sections indicate those that require further investigation or raise health and safety concerns. Amber indicates work that is needed but not urgent, and Green indicates areas in satisfactory condition requiring normal maintenance.
-
-Where necessary, we can also use a drone to inspect less accessible parts of the property.
-
-Upon completion of the report, we would be happy to answer any further questions or discuss any particular concerns to provide additional information if necessary.
-
-We are currently booking for {availability}. The completed report will be issued within 5-7 working days after the inspection. If there are any cancellations we will look to bring this forward for you.
-
-The fee for the Level 3 Building Survey, excluding valuation, will be \xa3{fee} + VAT.
-
-If you are happy to proceed on this basis, could you please confirm the following:
-
-1. Who the report should be addressed to (jointly with a partner or spouse if applicable)
-2. Your current home address
-
-We will then email the Terms and Conditions for signature. Payment can be made via bank transfer; our bank details will be provided on the invoice.
-
-Our Google reviews:
-https://tinyurl.com/CWH-Surveyors
-
-Please feel free to contact me at your convenience via phone or email if you would like to discuss anything further.\
+L3_HTML = """\
+{note_para}
+{p_recommend_l3}
+{p_l3_desc}
+{p_gardens}
+{p_ratings}
+{p_drone}
+{p_followup}
+{p_avail_l3}
+{p_fee}
+{p_proceed}
+{ol_confirm}
+{p_terms_l3}
+{p_reviews}
+{p_close}
 """
+
+def build_html_body(name, address, fee, availability, survey_type, notes):
+    p = _p  # shorthand
+    ol = _ol
+
+    note_para = p(notes) if notes.strip() else ""
+    p_gardens   = p("Gardens and grounds are included. A visual inspection of the services is conducted; however, we always recommend that up-to-date test certificates be provided for these. We would also lift any accessible drain covers on site to assess the condition.")
+    p_ratings   = p("Each section is assigned a condition rating (Green, Amber, or Red). Red sections indicate those that require further investigation or pose health and safety concerns. Amber indicates work that is required but not urgent, and Green indicates areas in satisfactory condition with regular maintenance required.")
+    p_followup  = p("Upon completion of the report, we would be happy to answer any further questions or discuss any particular concerns to provide more information if necessary.")
+    p_proceed   = p("If you are happy to proceed on this basis, could you please confirm the following:")
+    ol_confirm  = ol(
+        "Who the report should be addressed to (jointly with a partner or spouse if applicable)",
+        "Your current home address",
+    )
+    p_close     = p("Feel free to contact me at any time via phone or email if there is anything you would like to discuss further.")
+    p_reviews   = p('Our Google reviews: <a href="https://tinyurl.com/CWH-Surveyors">https://tinyurl.com/CWH-Surveyors</a>')
+    p_fee_bold  = p(f"The fee for the {'Level 2 Home Survey' if survey_type == 'l2' else 'Level 3 Building Survey'}, excluding valuation, will be <b>&pound;{fee} + VAT</b>.")
+
+    if survey_type == "l2":
+        greeting    = p(f"Hi {name},")
+        p_intro     = p(f"Thank you for your enquiry and the opportunity to quote for {address}.")
+        p_recommend = p("For a property of this age and type, I recommend the Level 2 Home Survey.")
+        p_l2_desc   = p("In summary, the Level 2 Home Survey covers all key elements of the property, including roof coverings, windows, doors, walls, and the damp proof course. Internally, an inspection of the roof space, where accessible, is conducted, including an assessment of the condition of the timbers and insulation levels. The report then covers all remaining internal elements of the property.")
+        p_legal     = p("There is also an overview of legal items which your advisors should check as part of the purchase.")
+        p_aim       = p("The report aims to enable you to make a fully informed decision about your purchase and to conduct any necessary investigations before exchanging contracts.")
+        p_avail     = p(f"We have availability from {availability}. Following the inspection, we will issue the completed report within 3-5 working days. If there are any cancellations, we would consider bringing this date forward.")
+        p_terms     = p("We will then issue the Terms and Conditions and an invoice via email. Payment can be made via bank transfer, and our bank details will be provided on the invoice.")
+        p_website   = p('Further information and a sample report can be found on our website: <a href="https://www.cwhsurveyors.co.uk/services/home-survey-reports/">https://www.cwhsurveyors.co.uk/services/home-survey-reports/</a>')
+        body_parts  = [greeting, p_intro, note_para, p_recommend, p_l2_desc, p_gardens, p_ratings, p_legal, p_aim, p_followup, p_fee_bold, p_avail, p_proceed, ol_confirm, p_terms, p_website, p_reviews, p_close]
+    else:
+        greeting      = p(f"Hi {name},")
+        p_intro       = p(f"Thank you for your enquiry and the opportunity to quote for {address}.")
+        p_recommend   = p("The Level 3 Building Survey will be the best option for a property of this age and type.")
+        p_l3_desc     = p("In summary, the Level 3 Survey encompasses all key elements of the property, including the roof covering, windows, doors, walls, and the damp proof course. Internally, an inspection of the roof space, where accessible, is conducted, including an assessment of the condition of the timbers and insulation levels. The report then covers all remaining internal elements of the property.")
+        p_drone       = p("Where necessary, we can also use a drone to inspect less accessible parts of the property.")
+        p_avail       = p(f"We are currently booking for {availability}. The completed report will be issued within 5-7 working days after the inspection. If there are any cancellations we will look to bring this forward for you.")
+        p_terms       = p("We will then email the Terms and Conditions for signature. Payment can be made via bank transfer; our bank details will be provided on the invoice.")
+        body_parts    = [greeting, p_intro, note_para, p_recommend, p_l3_desc, p_gardens, p_ratings, p_drone, p_followup, p_avail, p_fee_bold, p_proceed, ol_confirm, p_terms, p_reviews, p_close]
+
+    sig = HTML_SIGNATURE.format(logo=_sig_img_tag())
+    html = (
+        '<html><head><meta charset="utf-8"></head><body>'
+        + "".join(body_parts)
+        + sig
+        + "</body></html>"
+    )
+    return html
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def load_processed():
@@ -113,7 +178,8 @@ def save_processed(entry_ids: set):
 def scan_inbox():
     """Return list of dicts for unprocessed New Submission emails."""
     try:
-        import win32com.client
+        import pythoncom, win32com.client
+        pythoncom.CoInitialize()
         processed = load_processed()
         outlook   = win32com.client.Dispatch("Outlook.Application")
         ns        = outlook.GetNamespace("MAPI")
@@ -153,15 +219,16 @@ def scan_inbox():
     except Exception as e:
         return []
 
-def create_outlook_draft(to_email, subject, body):
-    """Create a plain-text draft in Outlook Drafts folder."""
-    import win32com.client
+def create_outlook_draft(to_email, subject, html_body):
+    """Create an HTML draft in Outlook Drafts folder."""
+    import pythoncom, win32com.client
+    pythoncom.CoInitialize()
     outlook = win32com.client.Dispatch("Outlook.Application")
     mail = outlook.CreateItem(0)   # 0 = olMailItem
     mail.To          = to_email
     mail.Subject     = subject
-    mail.BodyFormat  = 1           # 1 = plain text — best for deliverability
-    mail.Body        = body
+    mail.BodyFormat  = 2           # 2 = HTML
+    mail.HTMLBody    = html_body
     mail.Save()                    # saves to Drafts, does NOT send
     return True
 
@@ -321,8 +388,9 @@ with tab2:
     with col3:
         fee = st.text_input("Fee (£, excluding VAT)", placeholder="e.g. 550")
     with col4:
-        availability = st.text_input("Availability",
-                                     placeholder="e.g. week commencing 20th July")
+        avail_date = st.text_input("Availability date",
+                                   placeholder="e.g. 20th July",
+                                   help="'Week commencing' is added automatically.")
 
     notes = st.text_area("Personal note (optional — inserted after greeting)",
                           placeholder="e.g. It looks like a lovely property and we would be delighted to assist.",
@@ -330,30 +398,24 @@ with tab2:
 
     # ── Preview ───────────────────────────────────────────────────────────────
     if st.button("Preview quote", use_container_width=False):
-        if not client_name or not fee or not availability:
-            st.warning("Please fill in client name, fee, and availability before previewing.")
+        if not client_name or not fee or not avail_date:
+            st.warning("Please fill in client name, fee, and availability date before previewing.")
         else:
-            template = L2_BODY if "Level 2" in survey_type else L3_BODY
-            body = template.format(
-                name=client_name,
-                address=property_addr or "the property",
-                fee=fee,
-                availability=availability,
+            availability = f"week commencing {avail_date.strip()}"
+            html_body = build_html_body(
+                name        = client_name,
+                address     = property_addr or "the property",
+                fee         = fee,
+                availability= availability,
+                survey_type = "l2" if "Level 2" in survey_type else "l3",
+                notes       = notes,
             )
-            if notes.strip():
-                # Insert personal note after the greeting line
-                lines = body.split("\n")
-                insert_at = 2  # after "Hi {name}," and blank line
-                lines.insert(insert_at, notes.strip() + "\n")
-                body = "\n".join(lines)
-            full_body = body + SIGNATURE
-            st.session_state["preview_body"] = full_body
+            st.session_state["preview_html"]    = html_body
             st.session_state["preview_subject"] = property_addr or "Survey quotation"
 
-    if "preview_body" in st.session_state:
+    if "preview_html" in st.session_state:
         st.markdown("**Preview:**")
-        st.text_area("Email body", value=st.session_state["preview_body"],
-                     height=500, label_visibility="collapsed")
+        st.components.v1.html(st.session_state["preview_html"], height=600, scrolling=True)
 
         # ── Create draft ──────────────────────────────────────────────────────
         st.markdown("---")
@@ -363,9 +425,9 @@ with tab2:
             else:
                 try:
                     create_outlook_draft(
-                        to_email=client_email,
-                        subject=st.session_state["preview_subject"],
-                        body=st.session_state["preview_body"],
+                        to_email  = client_email,
+                        subject   = st.session_state["preview_subject"],
+                        html_body = st.session_state["preview_html"],
                     )
                     # Mark enquiry as processed
                     entry_id = prefill.get("entry_id")
@@ -380,7 +442,7 @@ with tab2:
                         f"Draft created in Outlook Drafts — addressed to **{client_email}**. "
                         f"Review and send from Outlook."
                     )
-                    st.session_state.pop("preview_body", None)
+                    st.session_state.pop("preview_html", None)
                     st.session_state.pop("preview_subject", None)
                 except Exception as ex:
                     st.error(f"Could not create Outlook draft: {ex}")
