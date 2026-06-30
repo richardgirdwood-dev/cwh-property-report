@@ -68,8 +68,37 @@ st.set_page_config(
 LOGO_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cwh_logo.png")
 PROCESSED_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "processed_enquiries.json")
 POSTCODE_RE   = re.compile(r'^[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}$', re.IGNORECASE)
-POPUP_RE      = re.compile(r'new submission from popup', re.IGNORECASE)
+PC_FIND_RE    = re.compile(r'\b([A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2})\b', re.IGNORECASE)
 NAME_RE       = re.compile(r'Dear\s+([A-Za-z\-]+)', re.IGNORECASE)
+
+def _extract_from_email(subject, body, sender_name, sender_email):
+    """Best-effort extraction of client name, property address, and email."""
+    # Client name: "Dear X" in body, else first word of sender display name
+    name_match  = NAME_RE.search(body or "")
+    client_name = name_match.group(1).strip() if name_match else (sender_name or "").split()[0]
+
+    # Property address: postcode found in subject first, then body
+    for text in (subject, body or ""):
+        pc_match = PC_FIND_RE.search(text)
+        if pc_match:
+            pc  = pc_match.group(1).strip().upper()
+            pc  = re.sub(r'\s+', ' ', pc)
+            if len(pc) > 4 and ' ' not in pc:
+                pc = pc[:-3] + ' ' + pc[-3:]
+            # Grab the text before the postcode on the same line as the address
+            line = text[:pc_match.start()].rstrip(', \n\r')
+            last_line = line.split('\n')[-1].split('\r')[-1].strip().rstrip(',')
+            property_addr = f"{last_line}, {pc}".strip(', ') if last_line else pc
+            break
+    else:
+        # No postcode found — use subject as fallback
+        property_addr = re.sub(r'^(RE:|FW:|new submission from popup[:\s]*)', '', subject,
+                                flags=re.IGNORECASE).strip()
+
+    # Client email: sender's SMTP address (empty for internal senders)
+    email = sender_email if sender_email and '@' in sender_email else ""
+
+    return client_name, property_addr, email
 
 def _p(text, last=False):
     """Wrap text in a simple HTML paragraph."""
@@ -175,8 +204,8 @@ def save_processed(entry_ids: set):
     with open(PROCESSED_LOG, "w") as f:
         json.dump(list(entry_ids), f)
 
-def scan_inbox():
-    """Return list of dicts for unprocessed New Submission emails."""
+def search_inbox(keyword="", days=60, limit=50):
+    """Return recent inbox emails, optionally filtered by keyword in subject or body."""
     try:
         import pythoncom, win32com.client
         pythoncom.CoInitialize()
@@ -187,36 +216,44 @@ def scan_inbox():
         items     = inbox.Items
         items.Sort("[ReceivedTime]", True)
 
-        # Look back 60 days
-        cutoff = (datetime.datetime.now() - datetime.timedelta(days=60)).strftime("%d/%m/%Y %H:%M")
+        cutoff   = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%d/%m/%Y %H:%M")
         filtered = items.Restrict(f"[ReceivedTime] >= '{cutoff}'")
 
+        kw = keyword.strip().lower()
         results = []
         for item in filtered:
             try:
                 subj = item.Subject or ""
-                if not POPUP_RE.search(subj):
+                body = item.Body   or ""
+                if kw and kw not in subj.lower() and kw not in body.lower():
                     continue
-                eid = item.EntryID
-                if eid in processed:
-                    continue
-                # Extract client name from body
-                name_match = NAME_RE.search(item.Body or "")
-                client_name = name_match.group(1).strip() if name_match else ""
-                # Property address: everything after "Popup" in subject
-                addr_match = re.search(r'popup[:\s]+(.+)', subj, re.IGNORECASE)
-                property_addr = addr_match.group(1).strip() if addr_match else subj
+                eid          = item.EntryID
+                sender_name  = item.SenderName         or ""
+                sender_email = item.SenderEmailAddress or ""
+                # Resolve Exchange DN to SMTP where possible
+                if sender_email.startswith("/O=") or sender_email.startswith("/o="):
+                    try:
+                        sender_email = item.Sender.GetExchangeUser().PrimarySmtpAddress
+                    except Exception:
+                        sender_email = ""
+                client_name, property_addr, client_email = _extract_from_email(
+                    subj, body, sender_name, sender_email)
                 results.append({
-                    "entry_id":    eid,
-                    "subject":     subj,
-                    "received":    str(item.ReceivedTime)[:10],
-                    "client_name": client_name,
-                    "property":    property_addr,
+                    "entry_id":     eid,
+                    "subject":      subj,
+                    "received":     str(item.ReceivedTime)[:10],
+                    "sender":       sender_name,
+                    "client_name":  client_name,
+                    "client_email": client_email,
+                    "property":     property_addr,
+                    "used":         eid in processed,
                 })
+                if len(results) >= limit:
+                    break
             except Exception:
                 continue
         return results
-    except Exception as e:
+    except Exception:
         return []
 
 def create_outlook_draft(to_email, subject, html_body):
@@ -342,29 +379,50 @@ with tab2:
         "Creates a plain-text draft in Outlook Drafts — review and send from there."
     )
 
-    # ── Inbox scan ────────────────────────────────────────────────────────────
-    with st.expander("📥 Import from inbox (New submission from Popup)", expanded=True):
-        if st.button("Scan inbox for new enquiries", use_container_width=True):
-            with st.spinner("Scanning inbox…"):
-                enquiries = scan_inbox()
-            st.session_state["enquiries"] = enquiries
+    # ── Inbox search ──────────────────────────────────────────────────────────
+    with st.expander("📥 Import details from an email", expanded=True):
+        col_kw, col_btn = st.columns([3, 1])
+        with col_kw:
+            keyword = st.text_input("Search inbox (leave blank to show all recent)",
+                                    placeholder="e.g. survey, postcode, client name…",
+                                    label_visibility="collapsed")
+        with col_btn:
+            do_search = st.button("Search", use_container_width=True)
 
-        enquiries = st.session_state.get("enquiries", [])
-        if enquiries:
-            st.success(f"Found {len(enquiries)} unprocessed enquiry/enquiries.")
-            options = {
-                f"{e['received']}  —  {e['property']}  ({e['client_name'] or 'name unknown'})": e
-                for e in enquiries
-            }
-            chosen_label = st.selectbox("Select enquiry to quote", list(options.keys()))
+        if do_search:
+            with st.spinner("Searching inbox…"):
+                results = search_inbox(keyword=keyword)
+            st.session_state["inbox_results"] = results
+
+        results = st.session_state.get("inbox_results", [])
+        if results:
+            options = {}
+            for e in results:
+                used_tag = " ✓" if e["used"] else ""
+                label = (f"{e['received']}  —  {e['subject'][:60]}  "
+                         f"[{e['sender']}]{used_tag}")
+                options[label] = e
+
+            chosen_label = st.selectbox("Select email", list(options.keys()),
+                                        label_visibility="collapsed")
             chosen = options[chosen_label]
-            st.session_state["prefill"] = {
-                "client_name": chosen["client_name"],
-                "property":    chosen["property"],
-                "entry_id":    chosen["entry_id"],
-            }
-        elif "enquiries" in st.session_state:
-            st.info("No new enquiries found in the last 60 days.")
+
+            # Show what was extracted
+            col_a, col_b, col_c = st.columns(3)
+            col_a.caption(f"Name detected: **{chosen['client_name'] or '—'}**")
+            col_b.caption(f"Email detected: **{chosen['client_email'] or '—'}**")
+            col_c.caption(f"Address detected: **{chosen['property'] or '—'}**")
+
+            if st.button("Use this email →", use_container_width=True):
+                st.session_state["prefill"] = {
+                    "client_name":  chosen["client_name"],
+                    "client_email": chosen["client_email"],
+                    "property":     chosen["property"],
+                    "entry_id":     chosen["entry_id"],
+                }
+                st.success("Details imported — fill in the form below.")
+        elif "inbox_results" in st.session_state:
+            st.info("No emails found matching that search.")
 
     st.markdown("---")
 
@@ -377,6 +435,7 @@ with tab2:
         client_name = st.text_input("Client first name",
                                     value=prefill.get("client_name", ""))
         client_email = st.text_input("Client email address",
+                                     value=prefill.get("client_email", ""),
                                      placeholder="e.g. john.smith@gmail.com")
     with col2:
         property_addr = st.text_input("Property address",
