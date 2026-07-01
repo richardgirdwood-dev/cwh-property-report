@@ -71,34 +71,59 @@ POSTCODE_RE   = re.compile(r'^[A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2}$', re.IGNOREC
 PC_FIND_RE    = re.compile(r'\b([A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2})\b', re.IGNORECASE)
 NAME_RE       = re.compile(r'Dear\s+([A-Za-z\-]+)', re.IGNORECASE)
 
-def _extract_from_email(subject, body, sender_name, sender_email):
-    """Best-effort extraction of client name, property address, and email."""
-    # Client name: "Dear X" in body, else first word of sender display name
-    name_match  = NAME_RE.search(body or "")
-    client_name = name_match.group(1).strip() if name_match else (sender_name or "").split()[0]
+def _extract_from_email(subject, body, sender_name, sender_email, to_email=""):
+    """Extract client name, property address, and email from a CWH popup enquiry email."""
+    body = body or ""
 
-    # Property address: postcode found in subject first, then body
-    for text in (subject, body or ""):
-        pc_match = PC_FIND_RE.search(text)
-        if pc_match:
-            pc  = pc_match.group(1).strip().upper()
-            pc  = re.sub(r'\s+', ' ', pc)
-            if len(pc) > 4 and ' ' not in pc:
-                pc = pc[:-3] + ' ' + pc[-3:]
-            # Grab the text before the postcode on the same line as the address
-            line = text[:pc_match.start()].rstrip(', \n\r')
-            last_line = line.split('\n')[-1].split('\r')[-1].strip().rstrip(',')
-            property_addr = f"{last_line}, {pc}".strip(', ') if last_line else pc
-            break
+    # ── 1. Try structured form fields (popup submission format) ───────────────
+    # Name field: "Name\n\nMR JASON J CARTER"
+    form_name  = re.search(r'(?:^|\n)Name\s*\n+\s*([^\n]+)', body)
+    form_email = re.search(r'(?:^|\n)Email\s*\n+\s*([\w.+\-]+@[\w.\-]+)', body)
+    form_addr  = re.search(r'Address of the Property to Be Surveyed\s*\n+\s*([^\n]+)', body)
+
+    # ── 2. Client name ────────────────────────────────────────────────────────
+    if form_name:
+        raw = form_name.group(1).strip()
+        # Strip titles: MR, MRS, MS, DR, MISS, etc.
+        raw = re.sub(r'^(MR|MRS|MS|MISS|DR|PROF|REV)\.?\s+', '', raw, flags=re.IGNORECASE).strip()
+        # Use first name only
+        client_name = raw.split()[0].capitalize()
     else:
-        # No postcode found — use subject as fallback
-        property_addr = re.sub(r'^(RE:|FW:|new submission from popup[:\s]*)', '', subject,
-                                flags=re.IGNORECASE).strip()
+        # Fallback: "Dear X" or "Hello X"
+        greet = re.search(r'(?:Dear|Hello)\s+([A-Za-z\-]+)', body)
+        client_name = greet.group(1).strip() if greet else (sender_name or "").split()[0]
 
-    # Client email: sender's SMTP address (empty for internal senders)
-    email = sender_email if sender_email and '@' in sender_email else ""
+    # ── 3. Client email ───────────────────────────────────────────────────────
+    if form_email:
+        client_email = form_email.group(1).strip()
+    elif to_email and '@' in to_email:
+        client_email = to_email.strip()
+    elif sender_email and '@' in sender_email and not sender_email.startswith('/O='):
+        client_email = sender_email
+    else:
+        client_email = ""
 
-    return client_name, property_addr, email
+    # ── 4. Property address ───────────────────────────────────────────────────
+    if form_addr:
+        property_addr = form_addr.group(1).strip().rstrip('.,')
+    else:
+        # Try postcode context in subject then body
+        for text in (subject, body):
+            pc_match = PC_FIND_RE.search(text)
+            if pc_match:
+                pc = pc_match.group(1).strip().upper()
+                pc = re.sub(r'\s+', ' ', pc)
+                if len(pc) > 4 and ' ' not in pc:
+                    pc = pc[:-3] + ' ' + pc[-3:]
+                line = text[:pc_match.start()].rstrip(', \n\r')
+                last_line = line.split('\n')[-1].split('\r')[-1].strip().rstrip(',')
+                property_addr = f"{last_line}, {pc}".strip(', ') if last_line else pc
+                break
+        else:
+            property_addr = re.sub(r'^(RE:|FW:|new submission from popup[:\s]*)', '',
+                                   subject, flags=re.IGNORECASE).strip()
+
+    return client_name, property_addr, client_email
 
 def _p(text, last=False):
     """Wrap text in a simple HTML paragraph."""
@@ -236,8 +261,9 @@ def search_inbox(keyword="", days=60, limit=50):
                         sender_email = item.Sender.GetExchangeUser().PrimarySmtpAddress
                     except Exception:
                         sender_email = ""
+                to_email = item.To or ""
                 client_name, property_addr, client_email = _extract_from_email(
-                    subj, body, sender_name, sender_email)
+                    subj, body, sender_name, sender_email, to_email)
                 results.append({
                     "entry_id":     eid,
                     "subject":      subj,
