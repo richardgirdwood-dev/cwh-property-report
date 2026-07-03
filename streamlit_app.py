@@ -378,8 +378,8 @@ with tab1:
                             with open(tmp_path, "rb") as f:
                                 pdf_bytes = f.read()
                             os.unlink(tmp_path)
-                            safe_pc  = postcode.replace(" ", "_")
-                            filename = f"{safe_pc}_Property_Report.pdf"
+                            safe_addr = re.sub(r'[\\/:*?"<>|]', '', address).strip().replace(' ', '_')
+                            filename  = f"{safe_addr}_Property_Report.pdf"
                             st.success(f"Report ready for **{address}, {postcode}**")
                             st.download_button(
                                 label="Download PDF Report",
