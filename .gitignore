@@ -11,19 +11,20 @@
 # But allow traversal into directories so their contents can be checked
 !*/
 
-# Allow only the actual project files
+# Allow only the actual public-deployment project files.
+# NOTE: "CWH Property Report/" (the evening batch runner) and
+# "CWH Internal Tools/" (the private two-tab Quote Generator app) are
+# deliberately NOT allowlisted here — both contain hardcoded local file
+# paths, and the latter also contains a real signature/email template.
+# They stay fully functional locally; they're just never pushed publicly.
 !/.gitignore
 !/README.md
 !/requirements.txt
 !/streamlit_app.py
 !/property_report_engine.py
 !/cwh_logo.png
-!/CWH Property Report/
-!/CWH Property Report/property_report_engine.py
-!/CWH Property Report/run_evening_reports.py
 
-# Re-ignore junk that could otherwise sneak in under the allowed folder
-CWH Property Report/__pycache__/
+# Re-ignore junk that could otherwise sneak in
 **/__pycache__/
 *.pyc
 *.pyo
