@@ -181,6 +181,206 @@ def fetch_listed_building(lat, lng, house_number=""):
     except Exception:
         return None
 
+def _radon_narrative(radon_desc):
+    """Turn the raw radon status text into a RICS-style narrative sentence."""
+    pct_match = re.search(r'(\d+-\d+%|>\d+%|<1%)', radon_desc)
+    pct = pct_match.group(1) if pct_match else None
+
+    if radon_desc.lower().startswith("low risk"):
+        return (
+            "The UK Health Security Agency identifies the area in which the property is "
+            "situated as one of low radon risk, with less than 1% of homes at or above the "
+            "Action Level. Radon protective measures are not routinely required, although "
+            "testing can be arranged for reassurance if desired — see www.ukradon.org."
+        )
+    elif radon_desc.lower().startswith("elevated risk"):
+        return (
+            f"The UK Health Security Agency identifies the area in which the property is "
+            f"situated as one where there is a moderate likelihood ({pct or 'an elevated level'}) "
+            f"of elevated radon levels. This means that a small but notable proportion of "
+            f"properties may be affected, and while remedial measures are not routinely "
+            f"required, radon testing is advisable for reassurance. Further details on radon "
+            f"gas and information on monitoring can be obtained from www.ukradon.org."
+        )
+    elif radon_desc.lower().startswith("high risk"):
+        return (
+            f"The UK Health Security Agency identifies the area in which the property is "
+            f"situated as one of higher radon risk (maximum radon potential {pct or 'elevated'}). "
+            f"Radon protective measures and/or testing are recommended prior to purchase — "
+            f"further details can be obtained from www.ukradon.org."
+        )
+    else:
+        return (
+            "UKHSA radon data could not be retrieved automatically for this location — the "
+            "interactive map at www.ukradon.org/information/ukmaps should be checked directly."
+        )
+
+def _clean_conservation_name(name):
+    """Strip a trailing 'conservation area' from the fetched name (some sources
+    already include it) and title-case the result, so it reads naturally when
+    'Conservation Area' is appended once in the sentence."""
+    stripped = re.sub(r'\s+conservation\s+area\s*$', '', name, flags=re.IGNORECASE).strip()
+    if stripped.isupper() or stripped.islower():
+        stripped = stripped.title()
+    return stripped
+
+def _join_list(items):
+    items = list(items)
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f" and {items[-1]}"
+
+def _school_phrase(schools):
+    """Describe school provision by age range only, not by name. Uses a simple
+    keyword heuristic on the school name since OSM rarely tags age range
+    reliably for UK schools."""
+    has_primary = any(
+        re.search(r'\b(primary|infant|junior)\b', s["name"], re.IGNORECASE) for s in schools
+    )
+    has_secondary = any(
+        re.search(r'\b(secondary|high school)\b', s["name"], re.IGNORECASE) for s in schools
+    )
+    if has_primary and has_secondary:
+        return "schooling for all ages"
+    elif has_primary:
+        return "primary schooling"
+    elif has_secondary:
+        return "secondary schooling"
+    else:
+        return "a school" if len(schools) == 1 else "schools"
+
+def _facilities_narrative(address, schools, amenities, stations, known_place=None):
+    """Build a 'Facilities' paragraph from real amenities/schools/rail data —
+    states only whether these facilities are present locally, not their names,
+    and does not invent roads or distances to towns the tool has no data for.
+
+    known_place: a real, geocoded settlement name (e.g. from the conservation
+    area lookup) to use instead of guessing from the address string — the
+    last comma-separated part of a multi-part address is often the county
+    (e.g. "Rutland"), not the actual village."""
+    if known_place:
+        town = known_place
+    else:
+        town = address.split(",")[-1].strip() if "," in address else address
+
+    categories = []
+    if amenities.get("pubs"):
+        categories.append("public houses")
+    if amenities.get("shops"):
+        categories.append("local shops")
+    if amenities.get("doctors"):
+        categories.append("a doctors' surgery")
+    if schools:
+        categories.append(_school_phrase(schools))
+
+    if categories:
+        para = (
+            f"The property is located within or close to {town}, which provides "
+            f"{_join_list(categories)} (source: OpenStreetMap — please verify current "
+            f"provision)."
+        )
+    else:
+        para = (
+            f"No significant local amenities were identified within the immediate vicinity "
+            f"of {town} via OpenStreetMap data — please verify on-site and add relevant "
+            f"detail here."
+        )
+
+    # Trunk road isn't in any of the tool's data sources — always left as a
+    # placeholder. Station name is filled in when known, otherwise also
+    # left as a placeholder rather than dropping the sentence.
+    station_name = stations[0][0] if stations else "[INSERT LOCATION]"
+    para += (
+        f" There are good transport links further afield via the railway station in "
+        f"{station_name} and the nearby [INSERT ROAD] trunk road."
+    )
+
+    return para
+
+def generate_draft_paragraph(address, postcode):
+    """
+    DRAFT text for the 'Facilities' and 'Local environment' sections of a
+    RICS survey report, built from the same live data sources as the PDF
+    report. This is a starting point for the surveyor to review and edit
+    before it goes into the report — it does not cover on-site observations
+    (grounds, parking, noise, etc.), only matters that can be checked from
+    live desktop data (nearby amenities/schools/rail, radon, conservation
+    area, listed building status).
+    """
+    address = _title_address(address)
+    postcode = postcode.strip().upper()
+    house_number = address.strip().split()[0].rstrip(",")
+
+    pc_data = fetch_postcode(postcode)
+    lat, lng = pc_data["lat"], pc_data["lng"]
+    if lat is None:
+        return f"Could not resolve postcode {postcode} — draft paragraph not generated."
+
+    radon_desc, _ = fetch_radon_status(lat, lng)
+    conservation_area = fetch_conservation_area(lat, lng)
+    listed_building = fetch_listed_building(lat, lng, house_number)
+    schools, amenities = fetch_schools_and_amenities(lat, lng)
+    stations = fetch_rail_stations(lat, lng)
+
+    ca_name = _clean_conservation_name(conservation_area) if conservation_area else None
+    facilities_para = _facilities_narrative(address, schools, amenities, stations, known_place=ca_name)
+
+    lines = []
+
+    lines.append(_radon_narrative(radon_desc))
+
+    if conservation_area:
+        lines.append(
+            f"The property is situated within the {ca_name} Conservation Area. "
+            "You should take further advice from your legal advisers with regard to living in "
+            "a Conservation Area, as this will restrict how the external appearance of the "
+            "property can be altered and, in certain instances, internal aspects too — this "
+            "may include replacement windows and doors, guttering, etc., and alterations may "
+            "need specific planning permission."
+        )
+    else:
+        lines.append(
+            "The property does not appear to be situated within a designated conservation "
+            "area (based on Planning Data / Historic England records — please verify)."
+        )
+
+    if listed_building:
+        grade = listed_building.get("grade", "")
+        ref = listed_building.get("ref", "")
+        lines.append(
+            f"The property appears to be a Grade {grade} listed building "
+            f"(Historic England list entry {ref}) — see H1. Listed building consent will be "
+            "required from the Local Planning Authority for most alterations."
+        )
+    else:
+        lines.append(
+            "No listed building record was identified at this address (based on Historic "
+            "England's National Heritage List — please verify)."
+        )
+
+    lines.append(
+        "Other than the matters noted above, I am not aware at present of any further "
+        "planning or environmental factors (based on desktop research) that may adversely "
+        "affect the property. However, your legal advisers should undertake the usual "
+        "searches and enquiries."
+    )
+
+    header = (
+        f"DRAFT — Facilities & Local environment paragraphs for {address}, {postcode}\n"
+        f"(review and edit before inserting into the report — does not cover on-site "
+        f"observations such as grounds, parking, or noise)\n"
+        + "-" * 78 + "\n\n"
+    )
+    return (
+        header
+        + "FACILITIES\n\n" + facilities_para
+        + "\n\nLOCAL ENVIRONMENT\n\n" + "\n\n".join(lines)
+    )
+
 def fetch_epc(postcode, house_number):
     """Finds the EPC certificate matching house_number at postcode. Returns dict of EPC data."""
     try:

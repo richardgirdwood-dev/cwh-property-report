@@ -88,7 +88,7 @@ def main():
 
     # Import the report engine from the same folder
     sys.path.insert(0, SCRIPT_DIR)
-    from property_report_engine import generate_report
+    from property_report_engine import generate_report, generate_draft_paragraph
 
     appointments = get_tomorrows_appointments()
     log(f"Found {len(appointments)} appointment(s) tomorrow")
@@ -118,18 +118,33 @@ def main():
         if os.path.exists(out_path):
             log(f"  -> Report already exists: {filename}, skipping")
             generated += 1
-            continue
+        else:
+            log(f"  -> Generating report -> {filename}")
+            try:
+                result = generate_report(address, postcode, out_path)
+                if result and os.path.exists(out_path):
+                    log(f"  -> Saved: {filename}")
+                    generated += 1
+                else:
+                    log(f"  -> Report generation returned no output")
+            except Exception as e:
+                log(f"  -> ERROR: {e}")
 
-        log(f"  -> Generating report -> {filename}")
-        try:
-            result = generate_report(address, postcode, out_path)
-            if result and os.path.exists(out_path):
-                log(f"  -> Saved: {filename}")
-                generated += 1
-            else:
-                log(f"  -> Report generation returned no output")
-        except Exception as e:
-            log(f"  -> ERROR: {e}")
+        # Draft "Local environment" paragraph for the surveyor to review/edit
+        # (runs independently of the PDF check above, so it still gets
+        # generated even if the PDF already existed from an earlier run)
+        draft_filename = f"{safe_date}_{safe_addr}_Draft_Paragraphs.txt"
+        draft_path = os.path.join(OUTPUT_DIR, draft_filename)
+        if os.path.exists(draft_path):
+            log(f"  -> Draft paragraph already exists: {draft_filename}, skipping")
+        else:
+            try:
+                draft_text = generate_draft_paragraph(address, postcode)
+                with open(draft_path, "w", encoding="utf-8") as f:
+                    f.write(draft_text)
+                log(f"  -> Draft paragraph saved: {draft_filename}")
+            except Exception as e:
+                log(f"  -> ERROR generating draft paragraph: {e}")
 
     log(f"Done. {generated} report(s) saved to {OUTPUT_DIR}")
     log("=" * 60)

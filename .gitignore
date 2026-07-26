@@ -1,21 +1,34 @@
-# Generated reports
-*.pdf
+# This repo's root is the Desktop folder, which also holds a large amount of
+# unrelated personal and business material (client records, contracts,
+# financial files, etc.) that must NEVER be committed here. To make an
+# accidental `git add -A` / `git add .` safe, this file works as an
+# allowlist: everything is ignored by default, and only the specific
+# project files below are permitted.
 
-# Debug / scratch files
-debug*.py
-debug*.png
-preview*.png
-daily_property_reports.py
-generate_property_report.py
+# Ignore everything by default
+*
 
-# Python
-__pycache__/
+# But allow traversal into directories so their contents can be checked
+!*/
+
+# Allow only the actual project files
+!/.gitignore
+!/README.md
+!/requirements.txt
+!/streamlit_app.py
+!/property_report_engine.py
+!/cwh_logo.png
+!/CWH Property Report/
+!/CWH Property Report/property_report_engine.py
+!/CWH Property Report/run_evening_reports.py
+
+# Re-ignore junk that could otherwise sneak in under the allowed folder
+CWH Property Report/__pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 .env
 venv/
 .venv/
-
-# OS
 .DS_Store
 Thumbs.db
