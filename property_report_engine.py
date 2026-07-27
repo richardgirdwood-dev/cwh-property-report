@@ -242,7 +242,8 @@ def _school_phrase(schools):
         re.search(r'\b(primary|infant|junior)\b', s["name"], re.IGNORECASE) for s in schools
     )
     has_secondary = any(
-        re.search(r'\b(secondary|high school)\b', s["name"], re.IGNORECASE) for s in schools
+        re.search(r'\b(secondary|high school|community college|comprehensive)\b', s["name"], re.IGNORECASE)
+        for s in schools
     )
     if has_primary and has_secondary:
         return "schooling for all ages"
