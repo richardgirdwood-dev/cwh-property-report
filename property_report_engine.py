@@ -182,6 +182,30 @@ def fetch_listed_building(lat, lng, house_number=""):
     except Exception:
         return None
 
+COAL_RISK_LAYERS = (
+    ("high", "DevelopmentHighRiskArea"),
+    ("low",  "DevelopmentLowRiskArea"),
+)
+
+def fetch_coal_mining_risk(lat, lng):
+    """Returns 'high', 'low', or None using the Mining Remediation Authority's
+    (formerly the Coal Authority) official development risk area layers."""
+    base = "https://services-eu1.arcgis.com/Qn4lKcPDVHNivEyr/arcgis/rest/services"
+    for risk, layer in COAL_RISK_LAYERS:
+        try:
+            url = (
+                f"{base}/{layer}/FeatureServer/0/query"
+                f"?geometry={lng},{lat}&geometryType=esriGeometryPoint&inSR=4326"
+                f"&spatialRel=esriSpatialRelIntersects&outFields=HYPERLINK"
+                f"&returnGeometry=false&f=json"
+            )
+            r = requests.get(url, timeout=10, headers=HEADERS)
+            if r.json().get("features"):
+                return risk
+        except Exception:
+            continue
+    return None
+
 def _radon_narrative(radon_desc):
     """Turn the raw radon status text into a RICS-style narrative sentence."""
     pct_match = re.search(r'(\d+-\d+%|>\d+%|<1%)', radon_desc)
@@ -798,6 +822,7 @@ def generate_report(address, postcode, output_path):
     # Step 2 — parallel-ish data fetching
     conservation_area = fetch_conservation_area(lat, lng)
     listed_building   = fetch_listed_building(lat, lng, house_number)
+    coal_risk         = fetch_coal_mining_risk(lat, lng)
     epc               = fetch_epc(postcode, house_number)
     sales, rm_url     = fetch_sales_history(postcode, house_number)
     stations          = fetch_rail_stations(lat, lng)
@@ -926,6 +951,34 @@ def generate_report(address, postcode, output_path):
         lb_note = "Confirm with Historic England if listing status is critical to the survey."
     _section(story, "🏰", "Listed Building Status  (Historic England)", lb_rows,
              note=lb_note, col_widths=(40*mm, 98*mm, 20*mm))
+
+    # Coal Mining Risk
+    coal_gov_link = link(
+        "https://www.gov.uk/government/publications/coal-mining-data-development-high-risk-areas",
+        "gov.uk — coal mining data"
+    )
+    if coal_risk == "high":
+        cm_rows = [
+            ("Status", "WITHIN a Coal Mining Development High Risk Area", "HIGH RISK", RED),
+            ("Source", coal_gov_link, "", None),
+        ]
+        cm_note = ("A Coal Mining Report (CON29M) is recommended prior to purchase — instruct via a "
+                   "solicitor or directly with the Mining Remediation Authority (coal.gov.uk).")
+    elif coal_risk == "low":
+        cm_rows = [
+            ("Status", "WITHIN a Coal Mining Development Low Risk Area", "LOW RISK", AMBER),
+            ("Source", coal_gov_link, "", None),
+        ]
+        cm_note = "Low risk area — a Coal Mining Report is not routinely required but may still be advisable."
+    else:
+        cm_rows = [
+            ("Status", "Not within a recorded coal mining development risk area (indicative)", "", None),
+            ("Source", coal_gov_link, "", None),
+        ]
+        cm_note = ("Based on Mining Remediation Authority (formerly the Coal Authority) risk area data — "
+                   "confirm via a CON29M search if in doubt.")
+    _section(story, "⛏", "Coal Mining Risk  (Mining Remediation Authority)", cm_rows,
+             note=cm_note, col_widths=(40*mm, 98*mm, 20*mm))
 
     # Planning History
     _section(story, "📋", "Planning History", [
