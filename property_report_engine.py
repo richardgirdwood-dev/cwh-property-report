@@ -7,6 +7,7 @@ Usage: generate_report(address, postcode, output_path)
 import os
 import re
 import math
+import time
 import requests
 from datetime import datetime
 from bs4 import BeautifulSoup
@@ -555,16 +556,22 @@ OVERPASS_MIRRORS = [
     "https://overpass.kumi.systems/api/interpreter",
 ]
 
-def _overpass(query, timeout=30):
-    """POST an Overpass query, trying mirrors until one succeeds."""
-    for url in OVERPASS_MIRRORS:
-        try:
-            r = requests.post(url, data={"data": query},
-                              headers=OVERPASS_HEADERS, timeout=timeout)
-            if r.status_code == 200 and r.text.strip():
-                return r.json()
-        except Exception:
-            continue
+def _overpass(query, timeout=30, retries=2):
+    """POST an Overpass query, trying every mirror, and retrying the whole
+    mirror list up to `retries` times if all of them fail first time round —
+    the free Overpass mirrors intermittently time out or rate-limit, and a
+    short retry clears most of those transient failures."""
+    for attempt in range(retries):
+        for url in OVERPASS_MIRRORS:
+            try:
+                r = requests.post(url, data={"data": query},
+                                  headers=OVERPASS_HEADERS, timeout=timeout)
+                if r.status_code == 200 and r.text.strip():
+                    return r.json()
+            except Exception:
+                continue
+        if attempt < retries - 1:
+            time.sleep(3)
     return {"elements": []}
 
 def fetch_rail_stations(lat, lng):
