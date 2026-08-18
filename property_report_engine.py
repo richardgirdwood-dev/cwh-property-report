@@ -705,6 +705,39 @@ def fetch_bedrock_geology(lat, lng):
             continue
     return result
 
+CLAY_KEYWORDS = ("clay", "till", "diamicton", "mudstone", "boulder clay")
+
+def assess_clay_soil(geology):
+    """Practical clay/no-clay indicator derived from BGS bedrock + superficial
+    lithology text (both can be clay-bearing — e.g. London Clay is bedrock,
+    boulder clay/till is superficial). This is a keyword read of the same
+    1:625,000 regional dataset already fetched, not a separate data source,
+    so it inherits the same scale limitation (won't catch localised pockets
+    like clay-with-flints on chalk)."""
+    bedrock     = geology.get("bedrock") or {}
+    superficial = geology.get("superficial") or {}
+    b_lith = (bedrock.get("lithology") or "").lower()
+    s_lith = (superficial.get("lithology") or "").lower()
+
+    b_clay = any(kw in b_lith for kw in CLAY_KEYWORDS)
+    s_clay = any(kw in s_lith for kw in CLAY_KEYWORDS)
+
+    if s_clay and b_clay:
+        return ("YES", f"Both the superficial deposits ({superficial.get('lithology')}) "
+                        f"and bedrock ({bedrock.get('lithology')}) are clay-bearing.")
+    elif s_clay:
+        return ("YES", f"The superficial deposits at this location are recorded as "
+                        f"{superficial.get('lithology')}, which is clay-bearing.")
+    elif b_clay:
+        return ("YES", f"The bedrock at this location is recorded as {bedrock.get('lithology')}, "
+                        f"which is clay-bearing.")
+    elif superficial or bedrock:
+        basis = superficial.get('lithology') if superficial else bedrock.get('lithology')
+        return ("NO", f"Neither the recorded superficial deposits nor bedrock indicate clay — "
+                       f"nearest surface material is {basis}.")
+    else:
+        return ("UNKNOWN", "No bedrock or superficial geology record available at this location.")
+
 SHOP_TYPES = {"supermarket", "convenience", "general", "department_store", "mall"}
 
 def fetch_schools_and_amenities(lat, lng):
@@ -1190,7 +1223,10 @@ def generate_report(address, postcode, output_path):
         ]
         soil_block.append(_rows_table(soil_rows, (28*mm, 44*mm, 14*mm)))
     else:
-        soil_block.append(Paragraph(f'Check: {link("https://www.landis.org.uk/soilscapes/", "LandIS Soilscapes viewer")}', NOTE))
+        soil_block.append(Paragraph(
+            "Cranfield University retired the free Soilscapes viewer/API — data now requires a "
+            "registered LandIS Portal account (portal.landis.org.uk). See the Clay Soil Indicator "
+            "below for a practical alternative.", NOTE))
     soil_block.append(Paragraph("Regional soilscape classification — not a site-specific survey.", NOTE))
 
     two_col3 = Table([[rail_block, Spacer(4*mm,1), soil_block]], colWidths=[96*mm, 4*mm, 80*mm])
@@ -1223,9 +1259,15 @@ def generate_report(address, postcode, output_path):
         ))
     else:
         geo_rows.append(("Superficial Deposits", "None recorded — bedrock at or near surface", "", None))
+    clay_verdict, clay_reason = assess_clay_soil(geology)
+    clay_badge_color = {"YES": RED, "NO": GREEN, "UNKNOWN": colors.HexColor("#888888")}[clay_verdict]
+    geo_rows.append(("Clay Soil Indicator", clay_reason, clay_verdict, clay_badge_color))
     geo_rows.append(("BGS Geology Viewer", link("https://www.bgs.ac.uk/map-viewers/bgs-geology-viewer/", "View on BGS Geology Viewer"), "", None))
     _section(story, "🪨", "Bedrock & Superficial Geology  (British Geological Survey)", geo_rows,
              note="1:625,000 scale regional dataset — not a site-specific ground investigation. "
+                  "The Clay Soil Indicator is a keyword read of this same dataset (won't catch localised "
+                  "pockets like clay-with-flints on chalk — for foundation-critical decisions, a site-specific "
+                  "trial pit or geotechnical survey is still recommended). "
                   "Distinct from the Soilscapes classification above, which covers agricultural/drainage "
                   "soil type rather than underlying geology.",
              col_widths=(40*mm, 98*mm, 20*mm))
