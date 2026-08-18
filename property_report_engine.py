@@ -673,6 +673,38 @@ def fetch_soil(lat, lng):
     except Exception:
         return None, None
 
+BGS_GEOLOGY_URL = "https://services3.arcgis.com/7bJVHfju2RXdGZa4/arcgis/rest/services/BGS_625k_geology/FeatureServer"
+
+def fetch_bedrock_geology(lat, lng):
+    """Returns bedrock and superficial geology from the British Geological
+    Survey's official 625k Geology dataset (Living Atlas). Distinct from
+    Soilscapes above — this is the underlying geological substrate (bedrock
+    lithology/age and any superficial/drift deposits), not agricultural soil
+    classification."""
+    result = {"bedrock": None, "superficial": None}
+    for layer_id, key in ((1, "bedrock"), (2, "superficial")):
+        try:
+            url = (
+                f"{BGS_GEOLOGY_URL}/{layer_id}/query"
+                f"?geometry={lng},{lat}&geometryType=esriGeometryPoint&inSR=4326"
+                f"&spatialRel=esriSpatialRelIntersects&outFields=*"
+                f"&returnGeometry=false&f=json"
+            )
+            r = requests.get(url, timeout=10, headers=HEADERS)
+            features = r.json().get("features", [])
+            if features:
+                a = features[0]["attributes"]
+                result[key] = {
+                    "lithology":   a.get("LITHOLOGY", ""),
+                    "age":         a.get("AGE", ""),
+                    "period":      a.get("PERIOD", ""),
+                    "type":        a.get("TYPE", ""),
+                    "environment": a.get("ENVIRONMENT", ""),
+                }
+        except Exception:
+            continue
+    return result
+
 SHOP_TYPES = {"supermarket", "convenience", "general", "department_store", "mall"}
 
 def fetch_schools_and_amenities(lat, lng):
@@ -827,6 +859,7 @@ def generate_report(address, postcode, output_path):
     sales, rm_url     = fetch_sales_history(postcode, house_number)
     stations          = fetch_rail_stations(lat, lng)
     soil_data, soil_url = fetch_soil(lat, lng)
+    geology            = fetch_bedrock_geology(lat, lng)
     schools, amenities = fetch_schools_and_amenities(lat, lng)
 
     print(f"  Data fetched. Building PDF...")
@@ -1168,6 +1201,35 @@ def generate_report(address, postcode, output_path):
     ]))
     story.append(two_col3)
     story.append(Spacer(1, 4*mm))
+
+    # Bedrock & Superficial Geology
+    bedrock     = geology.get("bedrock")
+    superficial = geology.get("superficial")
+    geo_rows = []
+    if bedrock:
+        type_suffix = f", {bedrock['type']}" if bedrock.get("type") else ""
+        geo_rows.append((
+            "Bedrock",
+            f"{bedrock.get('lithology','N/A')} — {bedrock.get('age','N/A')} ({bedrock.get('period','N/A')}{type_suffix})",
+            "", None,
+        ))
+    else:
+        geo_rows.append(("Bedrock", "No bedrock record found at this location", "", None))
+    if superficial:
+        geo_rows.append((
+            "Superficial Deposits",
+            f"{superficial.get('lithology','N/A')} — {superficial.get('age','N/A')}",
+            "", None,
+        ))
+    else:
+        geo_rows.append(("Superficial Deposits", "None recorded — bedrock at or near surface", "", None))
+    geo_rows.append(("BGS Geology Viewer", link("https://www.bgs.ac.uk/map-viewers/bgs-geology-viewer/", "View on BGS Geology Viewer"), "", None))
+    _section(story, "🪨", "Bedrock & Superficial Geology  (British Geological Survey)", geo_rows,
+             note="1:625,000 scale regional dataset — not a site-specific ground investigation. "
+                  "Distinct from the Soilscapes classification above, which covers agricultural/drainage "
+                  "soil type rather than underlying geology.",
+             col_widths=(40*mm, 98*mm, 20*mm))
+    story.append(Spacer(1, 2*mm))
 
     # Disclaimer
     story.append(HRFlowable(width="100%", thickness=0.4, color=colors.HexColor("#CCCCCC"), spaceAfter=2))
