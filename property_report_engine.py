@@ -340,7 +340,7 @@ def generate_draft_paragraph(address, postcode):
     """
     address = _title_address(address)
     postcode = postcode.strip().upper()
-    house_number = address.strip().split()[0].rstrip(",")
+    house_number = _extract_house_identifier(address)
 
     pc_data = fetch_postcode(postcode)
     lat, lng = pc_data["lat"], pc_data["lng"]
@@ -915,6 +915,27 @@ def _title_address(text):
         result.append(_cap_word(word, force=force))
     return " ".join(result)
 
+_GENERIC_NAME_PREFIXES = {"the", "a", "an"}
+
+def _extract_house_identifier(address):
+    """Returns the identifier used to match this property against sold-price,
+    EPC, and listed-building records. For numbered houses this is just the
+    house number (e.g. '12', '3a'). For named properties — very common in
+    rural UK addresses ('The Haybarn', 'The Old Vicarage', 'The Barn') — a
+    bare first word like 'The' is a near-useless wildcard that matches
+    almost any named property sharing the postcode (this caused a real bug:
+    Rightmove sales-history matching on 'the' alone picked up an unrelated
+    property, 'The Old Vicarage', for a search for 'The Haybarn'). Include
+    the next word too when the first word is just a generic article."""
+    words = address.strip().split()
+    if not words:
+        return ""
+    first = words[0].rstrip(",")
+    if first.lower() in _GENERIC_NAME_PREFIXES and len(words) > 1:
+        second = words[1].rstrip(",")
+        return f"{first} {second}"
+    return first
+
 def generate_report(address, postcode, output_path):
     """
     Fetch all data and generate a PDF report.
@@ -927,7 +948,7 @@ def generate_report(address, postcode, output_path):
     print(f"  Fetching data for {address}, {postcode}...")
 
     # Extract house number/name from address
-    house_number = address.strip().split()[0].rstrip(",")
+    house_number = _extract_house_identifier(address)
 
     # Step 1 — coordinates
     pc_data = fetch_postcode(postcode)
