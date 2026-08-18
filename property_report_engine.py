@@ -9,6 +9,7 @@ import re
 import math
 import time
 import requests
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from bs4 import BeautifulSoup
 
@@ -673,6 +674,46 @@ def fetch_soil(lat, lng):
     except Exception:
         return None, None
 
+UKSO_BGS_WMS_URL = "https://map.bgs.ac.uk/arcgis/services/UKSO/UKSO_BGS/MapServer/WMSServer"
+
+def fetch_uk_soil_texture(lat, lng):
+    """Returns detailed 1:50,000-scale soil texture/parent material data from
+    the BGS UK Soil Observatory (UKSO) — the site's ArcGIS REST endpoint
+    blocks direct query/identify (capabilities locked to 'Map' only), but
+    its WMS GetFeatureInfo interface is open and returns the same underlying
+    Parent Material Model data the interactive map uses. Much finer-grained
+    than the 625k bedrock/superficial geology above — this is what actually
+    picks up localised clay pockets (e.g. clay-with-flints on chalk) that
+    the coarser dataset misses."""
+    try:
+        d = 0.001
+        bbox = f"{lng-d},{lat-d},{lng+d},{lat+d}"
+        url = (
+            f"{UKSO_BGS_WMS_URL}?service=WMS&version=1.1.1&request=GetFeatureInfo"
+            f"&layers=Parent.Material.Soil.texture&query_layers=Parent.Material.Soil.texture"
+            f"&srs=EPSG:4326&bbox={bbox}&width=101&height=101&x=50&y=50"
+            f"&info_format=application/json"
+        )
+        r = requests.get(url, timeout=10, headers=HEADERS)
+        root = ET.fromstring(r.text)
+        fields = root.find("{http://www.esri.com/wms}FIELDS")
+        if fields is None:
+            fields = root.find("FIELDS")
+        if fields is None or not fields.get("SIMPLE_TEX"):
+            return None
+        a = fields.attrib
+        return {
+            "texture":          a.get("SIMPLE_TEX", ""),
+            "soil_group":       a.get("SOIL_GROUP", ""),
+            "soil_group_desc":  a.get("SOIL_GROUP_DESC", ""),
+            "depth":            a.get("SOIL_DEPTH", ""),
+            "depth_desc":       a.get("SOIL_DEPTH_DESC", ""),
+            "calcareous":       a.get("CACO3_RANK", ""),
+            "parent_material":  a.get("ESB_DESC", ""),
+        }
+    except Exception:
+        return None
+
 BGS_GEOLOGY_URL = "https://services3.arcgis.com/7bJVHfju2RXdGZa4/arcgis/rest/services/BGS_625k_geology/FeatureServer"
 
 def fetch_bedrock_geology(lat, lng):
@@ -707,13 +748,24 @@ def fetch_bedrock_geology(lat, lng):
 
 CLAY_KEYWORDS = ("clay", "till", "diamicton", "mudstone", "boulder clay")
 
-def assess_clay_soil(geology):
-    """Practical clay/no-clay indicator derived from BGS bedrock + superficial
-    lithology text (both can be clay-bearing — e.g. London Clay is bedrock,
-    boulder clay/till is superficial). This is a keyword read of the same
-    1:625,000 regional dataset already fetched, not a separate data source,
-    so it inherits the same scale limitation (won't catch localised pockets
-    like clay-with-flints on chalk)."""
+def assess_clay_soil(geology, soil_texture=None):
+    """Practical clay/no-clay indicator. Prefers the fine-grained (1:50,000)
+    UKSO soil texture data (soil_texture, from fetch_uk_soil_texture) when
+    available, since it catches localised clay pockets — e.g. clay-with-
+    flints on chalk — that the coarser 1:625,000 bedrock/superficial geology
+    dataset misses. Falls back to a keyword read of that coarser geology
+    data only if the UKSO texture lookup failed."""
+    if soil_texture and soil_texture.get("texture"):
+        tex = soil_texture["texture"]
+        tex_lower = tex.lower()
+        if "clay" in tex_lower:
+            return ("YES", f"UKSO soil texture (1:50,000) at this location is recorded as "
+                            f"{tex} — {soil_texture.get('soil_group_desc', '')}".rstrip(" —"))
+        else:
+            return ("NO", f"UKSO soil texture (1:50,000) at this location is recorded as "
+                           f"{tex}, not clay-bearing.")
+
+    # Fallback: coarser 625k bedrock/superficial geology, if the UKSO lookup failed
     bedrock     = geology.get("bedrock") or {}
     superficial = geology.get("superficial") or {}
     b_lith = (bedrock.get("lithology") or "").lower()
@@ -724,19 +776,23 @@ def assess_clay_soil(geology):
 
     if s_clay and b_clay:
         return ("YES", f"Both the superficial deposits ({superficial.get('lithology')}) "
-                        f"and bedrock ({bedrock.get('lithology')}) are clay-bearing.")
+                        f"and bedrock ({bedrock.get('lithology')}) are clay-bearing. "
+                        f"(1:625,000 regional data — UKSO detailed lookup was unavailable.)")
     elif s_clay:
         return ("YES", f"The superficial deposits at this location are recorded as "
-                        f"{superficial.get('lithology')}, which is clay-bearing.")
+                        f"{superficial.get('lithology')}, which is clay-bearing. "
+                        f"(1:625,000 regional data — UKSO detailed lookup was unavailable.)")
     elif b_clay:
         return ("YES", f"The bedrock at this location is recorded as {bedrock.get('lithology')}, "
-                        f"which is clay-bearing.")
+                        f"which is clay-bearing. "
+                        f"(1:625,000 regional data — UKSO detailed lookup was unavailable.)")
     elif superficial or bedrock:
         basis = superficial.get('lithology') if superficial else bedrock.get('lithology')
         return ("NO", f"Neither the recorded superficial deposits nor bedrock indicate clay — "
-                       f"nearest surface material is {basis}.")
+                       f"nearest surface material is {basis}. "
+                       f"(1:625,000 regional data — UKSO detailed lookup was unavailable.)")
     else:
-        return ("UNKNOWN", "No bedrock or superficial geology record available at this location.")
+        return ("UNKNOWN", "No soil texture, bedrock, or superficial geology record available at this location.")
 
 SHOP_TYPES = {"supermarket", "convenience", "general", "department_store", "mall"}
 
@@ -892,6 +948,7 @@ def generate_report(address, postcode, output_path):
     sales, rm_url     = fetch_sales_history(postcode, house_number)
     stations          = fetch_rail_stations(lat, lng)
     soil_data, soil_url = fetch_soil(lat, lng)
+    soil_texture       = fetch_uk_soil_texture(lat, lng)
     geology            = fetch_bedrock_geology(lat, lng)
     schools, amenities = fetch_schools_and_amenities(lat, lng)
 
@@ -1209,25 +1266,31 @@ def generate_report(address, postcode, output_path):
     rail_block.append(Paragraph("Straight-line distances. Driving distances will be greater.", NOTE))
 
     soil_block = [
-        Paragraph("🌱  Soil Type  (Cranfield / LandIS Soilscapes)", SECH),
+        Paragraph("🌱  Soil Texture  (BGS UK Soil Observatory)", SECH),
         HRFlowable(width="100%", thickness=1.2, color=MID_BLUE, spaceAfter=2),
     ]
-    if soil_data:
+    if soil_texture:
+        soil_rows = [
+            ("Texture",         soil_texture.get("texture", "N/A"),         "", None),
+            ("Soil Group",      soil_texture.get("soil_group", "N/A"),      "", None),
+            ("Depth",           soil_texture.get("depth", "N/A"),           "", None),
+            ("Calcareous",      soil_texture.get("calcareous", "N/A"),      "", None),
+            ("Parent Material", soil_texture.get("parent_material", "N/A"), "", None),
+        ]
+        soil_block.append(_rows_table(soil_rows, (28*mm, 44*mm, 14*mm)))
+    elif soil_data:
+        # Legacy LandIS Soilscapes path — kept in case Cranfield reinstates it
         soil_rows = [
             ("Classification", soil_data.get("name", "N/A"),                      f"TYPE {soil_data.get('ssid','')}", BROWN),
             ("Texture",        soil_data.get("texture",  "N/A"),                   "", None),
             ("Drainage",       soil_data.get("drainage", "N/A"),                   "", None),
             ("Fertility",      soil_data.get("fertility","N/A"),                   "", None),
             ("Land Cover",     soil_data.get("landcover","N/A"),                   "", None),
-            ("Soilscapes Map", link("https://www.landis.org.uk/soilscapes/", "LandIS Soilscapes viewer"), "", None),
         ]
         soil_block.append(_rows_table(soil_rows, (28*mm, 44*mm, 14*mm)))
     else:
-        soil_block.append(Paragraph(
-            "Cranfield University retired the free Soilscapes viewer/API — data now requires a "
-            "registered LandIS Portal account (portal.landis.org.uk). See the Clay Soil Indicator "
-            "below for a practical alternative.", NOTE))
-    soil_block.append(Paragraph("Regional soilscape classification — not a site-specific survey.", NOTE))
+        soil_block.append(Paragraph("Soil texture data unavailable for this location.", NOTE))
+    soil_block.append(Paragraph("Source: BGS UK Soil Observatory, 1:50,000 Parent Material Model.", NOTE))
 
     two_col3 = Table([[rail_block, Spacer(4*mm,1), soil_block]], colWidths=[96*mm, 4*mm, 80*mm])
     two_col3.setStyle(TableStyle([
@@ -1259,16 +1322,16 @@ def generate_report(address, postcode, output_path):
         ))
     else:
         geo_rows.append(("Superficial Deposits", "None recorded — bedrock at or near surface", "", None))
-    clay_verdict, clay_reason = assess_clay_soil(geology)
+    clay_verdict, clay_reason = assess_clay_soil(geology, soil_texture)
     clay_badge_color = {"YES": RED, "NO": GREEN, "UNKNOWN": colors.HexColor("#888888")}[clay_verdict]
     geo_rows.append(("Clay Soil Indicator", clay_reason, clay_verdict, clay_badge_color))
     geo_rows.append(("BGS Geology Viewer", link("https://www.bgs.ac.uk/map-viewers/bgs-geology-viewer/", "View on BGS Geology Viewer"), "", None))
     _section(story, "🪨", "Bedrock & Superficial Geology  (British Geological Survey)", geo_rows,
-             note="1:625,000 scale regional dataset — not a site-specific ground investigation. "
-                  "The Clay Soil Indicator is a keyword read of this same dataset (won't catch localised "
-                  "pockets like clay-with-flints on chalk — for foundation-critical decisions, a site-specific "
-                  "trial pit or geotechnical survey is still recommended). "
-                  "Distinct from the Soilscapes classification above, which covers agricultural/drainage "
+             note="Bedrock/superficial data is 1:625,000 scale (regional, not site-specific). The Clay Soil "
+                  "Indicator uses the finer 1:50,000 UKSO soil texture data above when available (falling back "
+                  "to this coarser dataset only if that lookup fails) — even so, for foundation-critical "
+                  "decisions a site-specific trial pit or geotechnical survey is still recommended. "
+                  "Distinct from the soil texture classification above, which covers agricultural/drainage "
                   "soil type rather than underlying geology.",
              col_widths=(40*mm, 98*mm, 20*mm))
     story.append(Spacer(1, 2*mm))
