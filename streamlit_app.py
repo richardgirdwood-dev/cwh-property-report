@@ -139,8 +139,14 @@ with tab_proofread:
         "invalid condition ratings, leftover template placeholder text, "
         "spelling and grammar issues, and standard sections that appear to "
         "be missing.\n\n"
+        "Client names, addresses, postcodes, emails and phone numbers are "
+        "redacted from the report text before anything is checked — including "
+        "before anything is sent to the spelling/grammar service — so personal "
+        "data never leaves this machine.\n\n"
         "_These are heuristic checks, not a formal RICS compliance review — "
-        "always read flagged passages in context before relying on them._"
+        "always read flagged passages in context before relying on them. "
+        "Redaction is regex-based, not guaranteed complete, so don't treat it "
+        "as a substitute for not sharing sensitive PDFs elsewhere._"
     )
 
     uploaded_pdf = st.file_uploader("Survey report (PDF)", type=["pdf"])

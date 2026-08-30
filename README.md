@@ -25,6 +25,13 @@ service — this last check needs an internet connection. These are
 heuristic checks on extracted PDF text, not a formal RICS compliance
 review.
 
+Before any check runs, client names, addresses, postcodes, emails and
+phone numbers are redacted from the extracted text — so nothing
+identifying is ever sent to the external spelling/grammar service. This
+redaction is regex-based rather than true NER, so treat it as a strong
+privacy safeguard rather than a guarantee, and don't rely on it as a
+substitute for keeping sensitive PDFs off shared machines.
+
 ## Setup
 
 **Requires Python 3.9+**

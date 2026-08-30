@@ -7,6 +7,13 @@ drafting mistakes: invalid condition ratings, leftover template
 placeholder text, standard sections that appear to be missing, and
 spelling/grammar issues.
 
+Personal data and addresses are redacted from the extracted text
+before any check runs — including before anything is sent to the
+external spelling/grammar service — so the surveyor's client details
+never leave the machine. This redaction is heuristic (regex-based,
+not true NER) and covers the common cases in a survey report, but
+should not be relied on as a legal-grade anonymisation guarantee.
+
 These are heuristic checks on extracted text, not a formal RICS
 compliance review — always read the flagged passages in context.
 """
@@ -65,6 +72,65 @@ SURVEY_TERM_WHITELIST = {
     "freehold", "hardstanding", "outbuilding", "outbuildings",
 }
 
+# ── Anonymisation ────────────────────────────────────────────────────────
+# Tokens use guillemets so they can never collide with the placeholder
+# patterns above (which match [...], <<...>>, {{...}}).
+REDACTED_ADDRESS = "‹ADDRESS›"
+REDACTED_POSTCODE = "‹POSTCODE›"
+REDACTED_NAME = "‹NAME›"
+REDACTED_EMAIL = "‹EMAIL›"
+REDACTED_PHONE = "‹PHONE›"
+REDACTION_TOKENS = {REDACTED_ADDRESS, REDACTED_POSTCODE, REDACTED_NAME, REDACTED_EMAIL, REDACTED_PHONE}
+
+POSTCODE_RE = re.compile(r'\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b', re.IGNORECASE)
+
+_STREET_SUFFIXES = (
+    r'Road|Street|Avenue|Lane|Close|Drive|Way|Court|Place|Gardens|Grove|'
+    r'Crescent|Terrace|Hill|Park|Row|Square|Mews|Walk|Rise|Green|Chase|'
+    r'Meadow|Meadows|View|End|Common|Fields'
+)
+STREET_ADDRESS_RE = re.compile(
+    r'\b\d{1,4}[A-Za-z]?\s+(?:[A-Z][a-zA-Z\'\-]*\s+){1,4}(?:' + _STREET_SUFFIXES + r')\b'
+)
+
+LABELLED_ADDRESS_RE = re.compile(
+    r'(?P<label>\b(?:property|address|subject property|site address)\s*[:\-]\s*)'
+    r'(?P<value>[^\n]{5,120}?)(?=[\.\n]|$)',
+    re.IGNORECASE,
+)
+
+LABELLED_NAME_RE = re.compile(
+    r'(?P<label>\b(?:surveyor|client|prepared by|inspected by|vendor|purchaser|'
+    r'owner|occupier|solicitor|buyer|seller|instructed by)\s*[:\-]\s*)'
+    r'(?P<value>(?:[A-Z]\.[ \t]*){0,2}[A-Za-z][A-Za-z\'\-]*(?:[ \t]+[A-Za-z][A-Za-z\'\-]*){0,3})',
+    re.IGNORECASE,
+)
+
+HONORIFIC_NAME_RE = re.compile(
+    r'\b(?:Mr|Mrs|Ms|Miss|Mx|Dr)\.?\s+[A-Z][a-zA-Z\'\-]+(?:\s+[A-Z][a-zA-Z\'\-]+){0,2}\b'
+)
+
+EMAIL_RE = re.compile(r'\b[\w.+-]+@[\w-]+\.[\w.-]+\b')
+
+PHONE_RE = re.compile(r'(?:\+44\s?\d{2,4}|\(?0\d{2,4}\)?)[\s-]?\d{3,4}[\s-]?\d{3,4}\b')
+
+
+def anonymise_text(text):
+    """Redacts addresses, postcodes, names, emails and phone numbers from a page of text."""
+    text = LABELLED_ADDRESS_RE.sub(lambda m: m.group('label') + REDACTED_ADDRESS, text)
+    text = STREET_ADDRESS_RE.sub(REDACTED_ADDRESS, text)
+    text = POSTCODE_RE.sub(REDACTED_POSTCODE, text)
+    text = LABELLED_NAME_RE.sub(lambda m: m.group('label') + REDACTED_NAME, text)
+    text = HONORIFIC_NAME_RE.sub(REDACTED_NAME, text)
+    text = EMAIL_RE.sub(REDACTED_EMAIL, text)
+    text = PHONE_RE.sub(REDACTED_PHONE, text)
+    return text
+
+
+def anonymise_pages(pages):
+    return [anonymise_text(p) for p in pages]
+
+
 LANGUAGETOOL_ENDPOINT = "https://api.languagetool.org/v2/check"
 LANGUAGETOOL_LANG = "en-GB"
 LANGUAGETOOL_ISSUE_LABELS = {
@@ -91,12 +157,17 @@ def _snippet(text, start, end, radius=60):
 
 
 def extract_pages(pdf_bytes):
-    """Returns a list of page texts (str, may be empty string for unreadable pages)."""
+    """
+    Returns a list of page texts (str, may be empty string for unreadable
+    pages), with personal data and addresses already redacted — every
+    downstream check, and anything sent to the external spelling/grammar
+    service, only ever sees the anonymised text.
+    """
     pages = []
     with pdfplumber.open(pdf_bytes) as pdf:
         for page in pdf.pages:
             pages.append(page.extract_text() or "")
-    return pages
+    return anonymise_pages(pages)
 
 
 def check_condition_ratings(pages):
@@ -189,6 +260,8 @@ def check_spelling_grammar(pages, progress_cb=None):
 
             if flagged.strip(".,;:'\"").lower() in SURVEY_TERM_WHITELIST:
                 continue
+            if any(tok in flagged or tok in ctx_text for tok in REDACTION_TOKENS):
+                continue  # our own redaction token, not a real spelling/grammar issue
 
             suggestions = [r["value"] for r in match.get("replacements", [])[:3]]
             message = match.get("message", "").strip()
