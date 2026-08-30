@@ -136,27 +136,47 @@ with tab_report:
 with tab_proofread:
     st.markdown(
         "Upload a survey report PDF to check it for common drafting mistakes: "
-        "invalid or inconsistent condition ratings, leftover template placeholder "
-        "text, mismatched address/date/surveyor details, and standard sections "
-        "that appear to be missing.\n\n"
+        "invalid condition ratings, leftover template placeholder text, "
+        "spelling and grammar issues, and standard sections that appear to "
+        "be missing.\n\n"
         "_These are heuristic checks, not a formal RICS compliance review — "
         "always read flagged passages in context before relying on them._"
     )
 
     uploaded_pdf = st.file_uploader("Survey report (PDF)", type=["pdf"])
+    check_spelling = st.checkbox(
+        "Also check spelling & grammar",
+        value=True,
+        help="Uses the free LanguageTool web service, so it needs an internet "
+             "connection and takes a few seconds per page.",
+    )
     run_proofread = st.button("Proofread report", type="primary", use_container_width=True)
 
     if run_proofread:
         if not uploaded_pdf:
             st.error("Please upload a PDF first.")
         else:
+            progress_bar = st.progress(0.0, text="Reading report…") if check_spelling else None
+
+            def _progress(done, total):
+                progress_bar.progress(
+                    done / total, text=f"Checking spelling & grammar — page {done} of {total}…"
+                )
+
             with st.spinner("Reading and checking the report…"):
                 try:
                     from survey_proofreader import proofread
-                    results = proofread(uploaded_pdf)
+                    results = proofread(
+                        uploaded_pdf,
+                        check_spelling=check_spelling,
+                        progress_cb=_progress if progress_bar else None,
+                    )
                 except Exception as ex:
                     results = None
                     st.error(f"Could not read this PDF: {ex}")
+
+            if progress_bar is not None:
+                progress_bar.empty()
 
             if results is not None:
                 if results["text_pages"] == 0:
@@ -164,22 +184,31 @@ with tab_proofread:
                         "No extractable text was found in this PDF — it may be a scanned "
                         "image without a text layer, which these checks cannot read."
                     )
-                elif results["total_issues"] == 0:
-                    st.success(
-                        f"No issues found across {results['page_count']} pages. "
-                        "This does not guarantee the report is complete or correct — "
-                        "it only means none of the automated checks were triggered."
-                    )
                 else:
-                    st.warning(
-                        f"{results['total_issues']} issue(s) flagged across "
-                        f"{results['page_count']} pages — review below."
-                    )
+                    if results["spelling_grammar_unavailable"]:
+                        st.info(
+                            "The spelling & grammar service couldn't be reached, so those "
+                            "results may be incomplete — check your internet connection and "
+                            "try again if needed."
+                        )
+
+                    if results["total_issues"] == 0:
+                        st.success(
+                            f"No issues found across {results['page_count']} pages. "
+                            "This does not guarantee the report is complete or correct — "
+                            "it only means none of the automated checks were triggered."
+                        )
+                    else:
+                        st.warning(
+                            f"{results['total_issues']} issue(s) flagged across "
+                            f"{results['page_count']} pages — review below."
+                        )
 
                     def _issue_list(issues):
                         for issue in issues:
                             loc = f"Page {issue['page']}" if issue["page"] else "Document-wide"
-                            st.markdown(f"- **{loc}** — {issue['message']}")
+                            prefix = f"[{issue['type']}] " if issue.get("type") else ""
+                            st.markdown(f"- **{loc}** — {prefix}{issue['message']}")
                             if issue.get("snippet"):
                                 st.caption(issue["snippet"])
 
@@ -191,9 +220,9 @@ with tab_proofread:
                         st.subheader(f"Leftover placeholder text ({len(results['placeholder_issues'])})")
                         _issue_list(results["placeholder_issues"])
 
-                    if results["consistency_issues"]:
-                        st.subheader(f"Address / date / surveyor consistency ({len(results['consistency_issues'])})")
-                        _issue_list(results["consistency_issues"])
+                    if results["spelling_grammar_issues"]:
+                        st.subheader(f"Spelling & grammar ({len(results['spelling_grammar_issues'])})")
+                        _issue_list(results["spelling_grammar_issues"])
 
                     if results["missing_sections"]:
                         st.subheader(f"Possibly missing sections ({len(results['missing_sections'])})")

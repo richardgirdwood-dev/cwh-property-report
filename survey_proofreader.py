@@ -1,20 +1,21 @@
 """
-Survey Proofreading — RICS survey-report consistency checks
+Survey Proofreading — RICS survey-report checks
 CWH Surveyors LLP
 
 Reads a RICS Home Survey (Level 2/3) PDF report and flags common
-drafting mistakes: invalid/inconsistent condition ratings, leftover
-template placeholder text, inconsistent address/date/surveyor details
-(a strong sign the wrong template was reused), and standard sections
-that appear to be missing.
+drafting mistakes: invalid condition ratings, leftover template
+placeholder text, standard sections that appear to be missing, and
+spelling/grammar issues.
 
 These are heuristic checks on extracted text, not a formal RICS
 compliance review — always read the flagged passages in context.
 """
 
 import re
+import time
 
 import pdfplumber
+import requests
 
 VALID_RATINGS = {"1", "2", "3", "NI"}
 
@@ -35,21 +36,6 @@ PLACEHOLDER_PATTERNS = [
     (re.compile(r'\bPLACEHOLDER\b', re.IGNORECASE), "'placeholder' drafting note"),
 ]
 
-POSTCODE_RE = re.compile(r'\b[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}\b')
-
-DATE_LABEL_RE = re.compile(
-    r'(date of inspection|inspection date)\s*[:\-]?\s*'
-    r'(\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}'
-    r'|\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})',
-    re.IGNORECASE,
-)
-
-SURVEYOR_LABEL_RE = re.compile(
-    r'(?:surveyor|inspected by|prepared by)[ \t]*[:\-][ \t]*'
-    r'([A-Za-z][A-Za-z\'\-]*(?:[ \t]+[A-Za-z][A-Za-z\'\-]*){1,3})',
-    re.IGNORECASE,
-)
-
 STANDARD_SECTIONS = [
     ("About the report", ["about the report", "about this report"]),
     ("General information", ["general information"]),
@@ -63,6 +49,30 @@ STANDARD_SECTIONS = [
     ("Risks", ["risks"]),
     ("What to do now", ["what to do now"]),
 ]
+
+# Surveying/property jargon that a general-purpose spellchecker doesn't know
+# and would otherwise flag as misspelled on every report.
+SURVEY_TERM_WHITELIST = {
+    "purlin", "purlins", "fascia", "fascias", "soffit", "soffits",
+    "spalling", "efflorescence", "dpc", "dpm", "epc", "eicr", "rics",
+    "cwh", "valley", "valleys", "hip", "hips", "verge", "verges",
+    "flashing", "flashings", "render", "rendering", "joist", "joists",
+    "truss", "trusses", "lintel", "lintels", "upvc", "ewi", "wc",
+    "woodworm", "subsidence", "heave", "downpipe", "downpipes",
+    "ridge", "ridges", "parapet", "parapets", "gable", "gables",
+    "mullion", "mullions", "transom", "transoms", "cavity", "cavities",
+    "asbestos", "reinstatement", "conveyancing", "leasehold",
+    "freehold", "hardstanding", "outbuilding", "outbuildings",
+}
+
+LANGUAGETOOL_ENDPOINT = "https://api.languagetool.org/v2/check"
+LANGUAGETOOL_LANG = "en-GB"
+LANGUAGETOOL_ISSUE_LABELS = {
+    "misspelling": "Spelling",
+    "grammar": "Grammar",
+    "typographical": "Punctuation",
+}
+MAX_PAGES_CHECKED = 40
 
 
 def _normalise_rating(raw):
@@ -123,40 +133,6 @@ def check_placeholders(pages):
     return issues
 
 
-def check_consistency(pages):
-    issues = []
-    full_text = "\n".join(pages)
-
-    postcodes = sorted(set(POSTCODE_RE.findall(full_text.upper())))
-    if len(postcodes) > 1:
-        issues.append({
-            "page": None,
-            "message": (
-                f"Multiple different postcodes found in the document ({', '.join(postcodes)}) "
-                "— check for leftover text from a different property's report."
-            ),
-            "snippet": None,
-        })
-
-    dates = sorted(set(m.group(2).strip() for m in DATE_LABEL_RE.finditer(full_text)))
-    if len(dates) > 1:
-        issues.append({
-            "page": None,
-            "message": f"Inconsistent inspection date across the document: {', '.join(dates)}.",
-            "snippet": None,
-        })
-
-    surveyors = sorted(set(m.group(1).strip() for m in SURVEYOR_LABEL_RE.finditer(full_text)))
-    if len(surveyors) > 1:
-        issues.append({
-            "page": None,
-            "message": f"More than one surveyor name found in the document: {', '.join(surveyors)}.",
-            "snippet": None,
-        })
-
-    return issues
-
-
 def check_missing_sections(pages):
     full_text_lower = "\n".join(pages).lower()
     missing = []
@@ -166,7 +142,73 @@ def check_missing_sections(pages):
     return missing
 
 
-def proofread(pdf_bytes):
+def _languagetool_check(text):
+    resp = requests.post(
+        LANGUAGETOOL_ENDPOINT,
+        data={"text": text, "language": LANGUAGETOOL_LANG},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.json().get("matches", [])
+
+
+def check_spelling_grammar(pages, progress_cb=None):
+    """
+    Runs each page's text through the LanguageTool public API and returns
+    (issues, service_unavailable). Requires internet access; on failure,
+    returns whatever was found so far plus a flag so the caller can warn
+    the user rather than silently showing zero issues.
+    """
+    issues = []
+    service_unavailable = False
+    checkable_pages = [
+        (page_no, text) for page_no, text in enumerate(pages, start=1)
+        if text.strip()
+    ][:MAX_PAGES_CHECKED]
+
+    for i, (page_no, text) in enumerate(checkable_pages):
+        if progress_cb:
+            progress_cb(i + 1, len(checkable_pages))
+        try:
+            matches = _languagetool_check(text)
+        except Exception:
+            service_unavailable = True
+            break
+
+        for match in matches:
+            issue_type = (match.get("rule") or {}).get("issueType", "")
+            label = LANGUAGETOOL_ISSUE_LABELS.get(issue_type)
+            if not label:
+                continue
+
+            context = match.get("context") or {}
+            ctx_text = context.get("text", "")
+            ctx_offset = context.get("offset", 0)
+            ctx_length = context.get("length", 0)
+            flagged = ctx_text[ctx_offset:ctx_offset + ctx_length].strip()
+
+            if flagged.strip(".,;:'\"").lower() in SURVEY_TERM_WHITELIST:
+                continue
+
+            suggestions = [r["value"] for r in match.get("replacements", [])[:3]]
+            message = match.get("message", "").strip()
+            if suggestions:
+                message += f" (suggestion: {', '.join(suggestions)})"
+
+            issues.append({
+                "page": page_no,
+                "type": label,
+                "message": message,
+                "snippet": ctx_text.strip() or None,
+            })
+
+        if i < len(checkable_pages) - 1:
+            time.sleep(3)  # public API rate limit: ~20 requests/minute
+
+    return issues, service_unavailable
+
+
+def proofread(pdf_bytes, check_spelling=True, progress_cb=None):
     """
     Runs all checks against an uploaded PDF (file-like object or bytes).
     Returns a dict with page count and grouped issue lists.
@@ -174,18 +216,26 @@ def proofread(pdf_bytes):
     pages = extract_pages(pdf_bytes)
     non_empty_pages = sum(1 for p in pages if p.strip())
 
+    spelling_grammar_issues = []
+    spelling_grammar_unavailable = False
+    if check_spelling and non_empty_pages:
+        spelling_grammar_issues, spelling_grammar_unavailable = check_spelling_grammar(
+            pages, progress_cb=progress_cb
+        )
+
     result = {
         "page_count": len(pages),
         "text_pages": non_empty_pages,
         "condition_rating_issues": check_condition_ratings(pages),
         "placeholder_issues": check_placeholders(pages),
-        "consistency_issues": check_consistency(pages),
         "missing_sections": check_missing_sections(pages),
+        "spelling_grammar_issues": spelling_grammar_issues,
+        "spelling_grammar_unavailable": spelling_grammar_unavailable,
     }
     result["total_issues"] = (
         len(result["condition_rating_issues"])
         + len(result["placeholder_issues"])
-        + len(result["consistency_issues"])
         + len(result["missing_sections"])
+        + len(result["spelling_grammar_issues"])
     )
     return result
