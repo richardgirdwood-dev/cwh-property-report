@@ -22,6 +22,7 @@
 !/requirements.txt
 !/streamlit_app.py
 !/property_report_engine.py
+!/survey_proofreader.py
 !/cwh_logo.png
 
 # Re-ignore junk that could otherwise sneak in
