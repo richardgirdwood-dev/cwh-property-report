@@ -45,7 +45,7 @@ def S(name, **kw):
     # Unique name per call to avoid ReportLab style cache collisions
     return ParagraphStyle(f"{name}_{id(kw)}", parent=styles["Normal"], **kw)
 
-HDR  = S("HDR",  fontSize=20, textColor=WHITE,     fontName="Helvetica-Bold")
+HDR  = S("HDR",  fontSize=20, textColor=WHITE,     fontName="Helvetica-Bold", leading=24)
 SUB  = S("SUB",  fontSize=10, textColor=colors.HexColor("#BDD7EE"), fontName="Helvetica")
 SECH = S("SECH", fontSize=11, textColor=DARK_BLUE, fontName="Helvetica-Bold", spaceBefore=4, spaceAfter=2)
 LBL  = S("LBL",  fontSize=8,  textColor=GREY_TEXT, fontName="Helvetica-Bold")
