@@ -207,40 +207,6 @@ def fetch_coal_mining_risk(lat, lng):
             continue
     return None
 
-def _radon_narrative(radon_desc):
-    """Turn the raw radon status text into a RICS-style narrative sentence."""
-    pct_match = re.search(r'(\d+-\d+%|>\d+%|<1%)', radon_desc)
-    pct = pct_match.group(1) if pct_match else None
-
-    if radon_desc.lower().startswith("low risk"):
-        return (
-            "The UK Health Security Agency identifies the area in which the property is "
-            "situated as one of low radon risk, with less than 1% of homes at or above the "
-            "Action Level. Radon protective measures are not routinely required, although "
-            "testing can be arranged for reassurance if desired — see www.ukradon.org."
-        )
-    elif radon_desc.lower().startswith("elevated risk"):
-        return (
-            f"The UK Health Security Agency identifies the area in which the property is "
-            f"situated as one where there is a moderate likelihood ({pct or 'an elevated level'}) "
-            f"of elevated radon levels. This means that a small but notable proportion of "
-            f"properties may be affected, and while remedial measures are not routinely "
-            f"required, radon testing is advisable for reassurance. Further details on radon "
-            f"gas and information on monitoring can be obtained from www.ukradon.org."
-        )
-    elif radon_desc.lower().startswith("high risk"):
-        return (
-            f"The UK Health Security Agency identifies the area in which the property is "
-            f"situated as one of higher radon risk (maximum radon potential {pct or 'elevated'}). "
-            f"Radon protective measures and/or testing are recommended prior to purchase — "
-            f"further details can be obtained from www.ukradon.org."
-        )
-    else:
-        return (
-            "UKHSA radon data could not be retrieved automatically for this location — the "
-            "interactive map at www.ukradon.org/information/ukmaps should be checked directly."
-        )
-
 def _clean_conservation_name(name):
     """Strip a trailing 'conservation area' from the fetched name (some sources
     already include it) and title-case the result, so it reads naturally when
@@ -328,15 +294,78 @@ def _facilities_narrative(address, schools, amenities, stations, known_place=Non
 
     return para
 
-def generate_draft_paragraph(address, postcode):
+# House-style phrase bank for the Risks / environmental matters section of a
+# RICS survey report, verbatim from CWH's standard report wording. Keep this
+# text in sync with the firm's Word phrase bank — it is meant to be pasted
+# straight into the report, not paraphrased.
+PHRASE_BANK = {
+    "no_flooding": (
+        "Information on the Government flood risk website indicates no history of "
+        "flooding affecting the property."
+    ),
+    "flooding": (
+        "The property is located in an area identified at being at {level} risk of "
+        "flooding due to {source} as noted on the Government Flood Risk indicator. "
+        "No evidence of flooding was noted at the time of the inspection, however, "
+        "property specific environmental searches should be obtained and you should "
+        "confirm that buildings insurance premiums are unaffected."
+    ),
+    "radon": (
+        "The UK Health Security Agency has identified the area in which the property "
+        "is situated as one in which, in a proportion of dwellings, the level of Radon "
+        "gas entering the property is such that remedial action is recommended. The "
+        "exact situation can be determined by a monitoring period. Further details on "
+        "Radon gas and information on monitoring can be obtained from the website "
+        "www.ukradon.org - see also Section I3."
+    ),
+    "conservation_area": (
+        "The property is located within the {name} Conservation Area. You should take "
+        "further advice from your legal advisers with regard to living in a "
+        "Conservation Area. Various information is also available on the internet, "
+        "however, you will be restricted to how you will be able to alter the "
+        "external appearance and also in certain instances, the internal aspects of "
+        "the property this may include replacement windows and doors, guttering etc. "
+        "and alterations may need specific planning permission."
+    ),
+    "listed_building": "The property is a listed building - see section H3.",
+    "road_rail_noise": (
+        "There is an amount of noise audible from within the garden due to the "
+        "proximity of the {source}. The impact is considered subjective and you "
+        "should form your own opinion prior to committing to purchase."
+    ),
+    "raf_bases": (
+        "Lincolnshire is home to a number of RAF stations. There is regular "
+        "overflying by RAF aircraft, associated noise and disturbance will be "
+        "experienced. Occasional background noise from high altitude commercial "
+        "aircraft can also occur from time to time. The impact is considered "
+        "subjective and you should form your own opinion before committing to "
+        "purchase."
+    ),
+    "coal_mining": (
+        "The property is located in an area of historic coal mining activity and a "
+        "mining report should be obtained from the Coal Authority via your legal "
+        "advisers - see Section I2."
+    ),
+    "clay_subsoil": (
+        "The property is in an area that has clay subsoils that could potentially "
+        "affect the stability of foundations - see Section D4."
+    ),
+    "no_planning_issues": (
+        "I am not aware at present of any planning, highway or other adverse "
+        "environmental factors that may affect the property. Nevertheless, your "
+        "legal adviser should make the usual searches."
+    ),
+}
+
+
+def _collect_draft_paragraph_data(address, postcode):
     """
-    DRAFT text for the 'Facilities' and 'Local environment' sections of a
-    RICS survey report, built from the same live data sources as the PDF
-    report. This is a starting point for the surveyor to review and edit
-    before it goes into the report — it does not cover on-site observations
-    (grounds, parking, noise, etc.), only matters that can be checked from
-    live desktop data (nearby amenities/schools/rail, radon, conservation
-    area, listed building status).
+    Shared data-gathering + phrase-selection logic behind both the text and
+    PDF draft-paragraph outputs. Returns None if the postcode can't be
+    resolved, otherwise a dict: address, postcode, facilities_para,
+    ready (list of house-style paragraphs safe to paste as-is), and
+    needs_input (list of items live desktop data can't resolve, flagged
+    rather than guessed at).
     """
     address = _title_address(address)
     postcode = postcode.strip().upper()
@@ -345,68 +374,185 @@ def generate_draft_paragraph(address, postcode):
     pc_data = fetch_postcode(postcode)
     lat, lng = pc_data["lat"], pc_data["lng"]
     if lat is None:
-        return f"Could not resolve postcode {postcode} — draft paragraph not generated."
+        return None
 
     radon_desc, _ = fetch_radon_status(lat, lng)
     conservation_area = fetch_conservation_area(lat, lng)
     listed_building = fetch_listed_building(lat, lng, house_number)
+    coal_risk = fetch_coal_mining_risk(lat, lng)
+    soil_texture = fetch_uk_soil_texture(lat, lng)
+    geology = fetch_bedrock_geology(lat, lng)
+    clay_verdict, _ = assess_clay_soil(geology, soil_texture)
     schools, amenities = fetch_schools_and_amenities(lat, lng)
     stations = fetch_rail_stations(lat, lng)
 
     ca_name = _clean_conservation_name(conservation_area) if conservation_area else None
     facilities_para = _facilities_narrative(address, schools, amenities, stations, known_place=ca_name)
 
-    lines = []
+    ready = []        # paragraphs safe to paste as-is
+    needs_input = []  # items desktop data can't resolve — flagged, not guessed
 
-    lines.append(_radon_narrative(radon_desc))
+    radon_flagged = radon_desc.lower().startswith(("elevated risk", "high risk"))
+    if radon_flagged:
+        ready.append(PHRASE_BANK["radon"])
+    elif not radon_desc.lower().startswith("low risk"):
+        needs_input.append(
+            "Radon — data unavailable automatically; check "
+            "www.ukradon.org/information/ukmaps directly."
+        )
 
     if conservation_area:
-        lines.append(
-            f"The property is situated within the {ca_name} Conservation Area. "
-            "You should take further advice from your legal advisers with regard to living in "
-            "a Conservation Area, as this will restrict how the external appearance of the "
-            "property can be altered and, in certain instances, internal aspects too — this "
-            "may include replacement windows and doors, guttering, etc., and alterations may "
-            "need specific planning permission."
-        )
-    else:
-        lines.append(
-            "The property does not appear to be situated within a designated conservation "
-            "area (based on Planning Data / Historic England records — please verify)."
-        )
+        ready.append(PHRASE_BANK["conservation_area"].format(name=ca_name))
 
     if listed_building:
-        grade = listed_building.get("grade", "")
-        ref = listed_building.get("ref", "")
-        lines.append(
-            f"The property appears to be a Grade {grade} listed building "
-            f"(Historic England list entry {ref}) — see H1. Listed building consent will be "
-            "required from the Local Planning Authority for most alterations."
-        )
-    else:
-        lines.append(
-            "No listed building record was identified at this address (based on Historic "
-            "England's National Heritage List — please verify)."
+        ready.append(PHRASE_BANK["listed_building"])
+
+    if coal_risk:
+        ready.append(PHRASE_BANK["coal_mining"])
+
+    if clay_verdict == "YES":
+        ready.append(PHRASE_BANK["clay_subsoil"])
+
+    county = (pc_data.get("county") or "").lower()
+    raf_flagged = "lincolnshire" in county
+    if raf_flagged:
+        ready.append(
+            PHRASE_BANK["raf_bases"]
+            + " [auto-included because the property is in Lincolnshire — remove if not applicable]"
         )
 
-    lines.append(
-        "Other than the matters noted above, I am not aware at present of any further "
-        "planning or environmental factors (based on desktop research) that may adversely "
-        "affect the property. However, your legal advisers should undertake the usual "
-        "searches and enquiries."
+    # "No planning issues" is a catch-all for a clean result — only include it
+    # when nothing more specific was found, otherwise it reads as self-contradictory.
+    if not any([conservation_area, listed_building, coal_risk, clay_verdict == "YES", raf_flagged]):
+        ready.append(PHRASE_BANK["no_planning_issues"])
+
+    needs_input.append(
+        "Flooding — could not be checked automatically (the Government flood risk "
+        "site requires CAPTCHA verification): "
+        f"https://check-long-term-flood-risk.service.gov.uk/postcode?postcode={postcode.replace(' ', '+')} "
+        "— then insert the 'No flooding' phrase, or the 'Flooding' phrase with the "
+        "risk level and source filled in."
+    )
+    needs_input.append(
+        "Road/rail noise — on-site judgement only; insert this phrase if noise from "
+        "a nearby railway line or road is noticeable in the garden, filling in which."
     )
 
+    return {
+        "address": address,
+        "postcode": postcode,
+        "facilities_para": facilities_para,
+        "ready": ready,
+        "needs_input": needs_input,
+    }
+
+
+def generate_draft_paragraph(address, postcode):
+    """
+    DRAFT text for the 'Facilities' and 'Risks' sections of a RICS survey
+    report, built from the same live data sources as the PDF report and
+    CWH's own house-style phrase bank (see PHRASE_BANK). This is a starting
+    point for the surveyor to review and edit before it goes into the
+    report — it does not cover on-site observations (grounds, parking,
+    noise, etc.), only matters that can be checked from live desktop data.
+    Items the desktop data can't determine (flood risk level/source, road/
+    rail noise) are listed separately as reminders rather than guessed at.
+    """
+    data = _collect_draft_paragraph_data(address, postcode)
+    if data is None:
+        return f"Could not resolve postcode {postcode.strip().upper()} — draft paragraph not generated."
+
     header = (
-        f"DRAFT — Facilities & Local environment paragraphs for {address}, {postcode}\n"
+        f"DRAFT — Facilities & Risks paragraphs for {data['address']}, {data['postcode']}\n"
         f"(review and edit before inserting into the report — does not cover on-site "
         f"observations such as grounds, parking, or noise)\n"
         + "-" * 78 + "\n\n"
     )
-    return (
+    body = (
         header
-        + "FACILITIES\n\n" + facilities_para
-        + "\n\nLOCAL ENVIRONMENT\n\n" + "\n\n".join(lines)
+        + "FACILITIES\n\n" + data["facilities_para"]
+        + "\n\nRISKS (ready to paste)\n\n" + "\n\n".join(data["ready"])
     )
+    if data["needs_input"]:
+        body += "\n\nNEEDS YOUR INPUT (not available from live desktop data)\n\n" + \
+            "\n\n".join(f"- {item}" for item in data["needs_input"])
+    return body
+
+
+def generate_draft_paragraph_pdf(address, postcode, output_path):
+    """
+    Same content as generate_draft_paragraph(), rendered as a PDF in the
+    same visual style as generate_report() — for batch runs that prepare
+    both the environmental report and this draft-paragraph sheet together
+    (e.g. the night before an inspection).
+    Returns output_path on success, or None if the postcode can't be resolved.
+    """
+    data = _collect_draft_paragraph_data(address, postcode)
+    if data is None:
+        return None
+
+    BODY   = S("DPBODY",  fontSize=9.5, textColor=TEXT, fontName="Helvetica", leading=14, spaceAfter=8)
+    WARN   = S("DPWARN",  fontSize=9.5, textColor=AMBER, fontName="Helvetica-Oblique", leading=14, spaceAfter=8)
+
+    doc = SimpleDocTemplate(
+        output_path, pagesize=A4,
+        leftMargin=15*mm, rightMargin=15*mm, topMargin=12*mm, bottomMargin=12*mm,
+    )
+    story = []
+
+    # Header banner — same style as the environmental report
+    logo_cell = ""
+    if os.path.exists(LOGO_PATH):
+        try:
+            logo_img = Image(LOGO_PATH, height=14*mm, width=45*mm)
+            logo_img.hAlign = "RIGHT"
+            logo_cell = logo_img
+        except Exception:
+            logo_cell = Paragraph("CWH Surveyors LLP", S("DPLGO", fontSize=9, textColor=WHITE, fontName="Helvetica-Bold", alignment=2))
+
+    hdr_table = Table([[
+        Paragraph(f"{data['address']},  {data['postcode']}", HDR),
+        logo_cell,
+    ], [
+        Paragraph("Draft report paragraphs — review and edit before inserting", SUB),
+        Paragraph("Facilities & Risks", S("DPDR", fontSize=8, textColor=colors.HexColor("#BDD7EE"), fontName="Helvetica", alignment=2)),
+    ]], colWidths=[130*mm, 50*mm])
+    hdr_table.setStyle(TableStyle([
+        ("BACKGROUND",   (0,0),(-1,-1), DARK_BLUE),
+        ("LEFTPADDING",  (0,0),(-1,-1), 5*mm),
+        ("RIGHTPADDING", (0,0),(-1,-1), 4*mm),
+        ("TOPPADDING",   (0,0),(-1,-1), 3*mm),
+        ("BOTTOMPADDING",(0,0),(-1,-1), 3*mm),
+        ("VALIGN",       (0,0),(-1,-1), "MIDDLE"),
+        ("ALIGN",        (1,0),(1,-1),  "RIGHT"),
+    ]))
+    story.append(hdr_table)
+    story.append(Spacer(1, 5*mm))
+
+    _section_header(story, "🏘", "Facilities")
+    story.append(Paragraph(data["facilities_para"], BODY))
+    story.append(Spacer(1, 2*mm))
+
+    _section_header(story, "⚠", "Risks — ready to paste")
+    for para in data["ready"]:
+        story.append(Paragraph(para, BODY))
+    story.append(Spacer(1, 2*mm))
+
+    if data["needs_input"]:
+        _section_header(story, "✏", "Needs your input")
+        for item in data["needs_input"]:
+            story.append(Paragraph(f"• {item}", WARN))
+        story.append(Spacer(1, 2*mm))
+
+    story.append(HRFlowable(width="100%", thickness=0.4, color=colors.HexColor("#CCCCCC"), spaceAfter=2))
+    story.append(Paragraph(
+        "<b>Note:</b> This is a drafting aid, not a finished report — it does not cover on-site "
+        "observations (grounds, parking, noise, etc.), only matters checkable from live desktop "
+        "data as at the time of generation. Review and edit every paragraph before it goes into "
+        "the report.", DISC))
+
+    doc.build(story)
+    return output_path
 
 def fetch_epc(postcode, house_number):
     """Finds the EPC certificate matching house_number at postcode. Returns dict of EPC data."""
