@@ -207,6 +207,87 @@ def fetch_coal_mining_risk(lat, lng):
             continue
     return None
 
+# EA open-data flood risk layers — the underlying GIS datasets behind the
+# consumer "check-long-term-flood-risk" tool, which itself requires CAPTCHA
+# and can't be queried programmatically. These are published separately as
+# WMS layers with no such restriction. NOTE: the exact WMS layer name and
+# response shape for these two endpoints have not been verified against a
+# live query (this environment's network can't reach environment.data.gov.uk) —
+# confirmed from EA documentation/dataset pages only, so treat as best-effort
+# pending a real test run.
+FLOOD_WMS_SOURCES = {
+    "river_sea": (
+        "https://environment.data.gov.uk/spatialdata/nafra2-risk-of-flooding-from-rivers-and-sea/wms",
+        "nafra2-risk-of-flooding-from-rivers-and-sea",
+    ),
+    "surface_water": (
+        "https://environment.data.gov.uk/spatialdata/risk-of-flooding-from-surface-water/wms",
+        "risk-of-flooding-from-surface-water",
+    ),
+}
+FLOOD_RISK_RANK = {"very low": 0, "low": 1, "medium": 2, "high": 3}
+
+def _wms_risk_band(url, layer_name, lat, lng):
+    """Point query (GetFeatureInfo) against an EA spatialdata WMS layer,
+    returning its risk-band attribute (High/Medium/Low/Very Low) if found.
+    Tries GeoJSON parsing first (environment.data.gov.uk is expected to be
+    GeoServer-backed, unlike the ArcGIS-based layers elsewhere in this
+    file) — deliberately tolerant of the exact property key name, since
+    that hasn't been confirmed live."""
+    try:
+        d = 0.001
+        bbox = f"{lng-d},{lat-d},{lng+d},{lat+d}"
+        full_url = (
+            f"{url}?service=WMS&version=1.1.1&request=GetFeatureInfo"
+            f"&layers={layer_name}&query_layers={layer_name}"
+            f"&srs=EPSG:4326&bbox={bbox}&width=101&height=101&x=50&y=50"
+            f"&feature_count=1&info_format=application/json"
+        )
+        r = requests.get(full_url, timeout=10, headers=HEADERS)
+        features = r.json().get("features") or []
+        if not features:
+            return None
+        props = features[0].get("properties", {}) or {}
+        for key, val in props.items():
+            if "risk" in key.lower() and "band" in key.lower() and val:
+                return str(val).strip()
+        return None
+    except Exception:
+        return None
+
+def fetch_flood_risk(lat, lng):
+    """
+    Returns {"river_sea": level_or_None, "surface_water": level_or_None},
+    each level one of 'High'/'Medium'/'Low'/'Very Low'. Uses the EA's open
+    NaFRA2 (Risk of Flooding from Rivers and Sea) and RoFSW (Risk of
+    Flooding from Surface Water) datasets directly, not the CAPTCHA-gated
+    consumer flood checker.
+    """
+    return {
+        key: _wms_risk_band(url, layer_name, lat, lng)
+        for key, (url, layer_name) in FLOOD_WMS_SOURCES.items()
+    }
+
+def _flood_risk_summary(flood_risk):
+    """Reduces fetch_flood_risk()'s per-source dict to (level, source_label)
+    for the phrase bank — the highest band found across both sources, and
+    which source(s) drove it. Returns (None, None) if neither resolved."""
+    labels = {"river_sea": "proximity of the river", "surface_water": "surface water"}
+    best_level, best_rank, best_sources = None, -1, []
+    for key, band in flood_risk.items():
+        if not band:
+            continue
+        rank = FLOOD_RISK_RANK.get(band.strip().lower())
+        if rank is None:
+            continue
+        if rank > best_rank:
+            best_rank, best_level, best_sources = rank, band.strip(), [labels[key]]
+        elif rank == best_rank:
+            best_sources.append(labels[key])
+    if best_level is None:
+        return None, None
+    return best_level, " and ".join(best_sources)
+
 def _clean_conservation_name(name):
     """Strip a trailing 'conservation area' from the fetched name (some sources
     already include it) and title-case the result, so it reads naturally when
@@ -380,6 +461,7 @@ def _collect_draft_paragraph_data(address, postcode):
     conservation_area = fetch_conservation_area(lat, lng)
     listed_building = fetch_listed_building(lat, lng, house_number)
     coal_risk = fetch_coal_mining_risk(lat, lng)
+    flood_level, flood_source = _flood_risk_summary(fetch_flood_risk(lat, lng))
     soil_texture = fetch_uk_soil_texture(lat, lng)
     geology = fetch_bedrock_geology(lat, lng)
     clay_verdict, _ = assess_clay_soil(geology, soil_texture)
@@ -426,13 +508,17 @@ def _collect_draft_paragraph_data(address, postcode):
     if not any([conservation_area, listed_building, coal_risk, clay_verdict == "YES", raf_flagged]):
         ready.append(PHRASE_BANK["no_planning_issues"])
 
-    needs_input.append(
-        "Flooding — could not be checked automatically (the Government flood risk "
-        "site requires CAPTCHA verification): "
-        f"https://check-long-term-flood-risk.service.gov.uk/postcode?postcode={postcode.replace(' ', '+')} "
-        "— then insert the 'No flooding' phrase, or the 'Flooding' phrase with the "
-        "risk level and source filled in."
-    )
+    if flood_level is None:
+        needs_input.append(
+            "Flooding — could not be checked automatically for this location: "
+            f"https://check-long-term-flood-risk.service.gov.uk/postcode?postcode={postcode.replace(' ', '+')} "
+            "— then insert the 'No flooding' phrase, or the 'Flooding' phrase with the "
+            "risk level and source filled in."
+        )
+    elif flood_level.lower() == "very low":
+        ready.append(PHRASE_BANK["no_flooding"])
+    else:
+        ready.append(PHRASE_BANK["flooding"].format(level=flood_level.lower(), source=flood_source))
     needs_input.append(
         "Road/rail noise — on-site judgement only; insert this phrase if noise from "
         "a nearby railway line or road is noticeable in the garden, filling in which."
@@ -1111,6 +1197,7 @@ def generate_report(address, postcode, output_path):
     conservation_area = fetch_conservation_area(lat, lng)
     listed_building   = fetch_listed_building(lat, lng, house_number)
     coal_risk         = fetch_coal_mining_risk(lat, lng)
+    flood_risk        = fetch_flood_risk(lat, lng)
     epc               = fetch_epc(postcode, house_number)
     sales, rm_url     = fetch_sales_history(postcode, house_number)
     stations          = fetch_rail_stations(lat, lng)
@@ -1188,12 +1275,20 @@ def generate_report(address, postcode, output_path):
 
     # Flood Risk
     pc_enc = postcode.replace(" ", "+")
+    FLOOD_BADGE_COLOR = {"high": RED, "medium": AMBER, "low": GREEN, "very low": GREEN}
+
+    def _flood_row(label, level):
+        if not level:
+            return (label, "Could not be determined automatically — see link below", "CHECK", AMBER)
+        return (label, f"{level} risk", level.lower(), FLOOD_BADGE_COLOR.get(level.lower(), AMBER))
+
     _section(story, "🌊", "Flood Risk  (Environment Agency)", [
-        ("Rivers & Sea",  "Check required — see link below", "CHECK", AMBER),
-        ("Surface Water", "Check required — see link below", "CHECK", AMBER),
+        _flood_row("Rivers & Sea", flood_risk.get("river_sea")),
+        _flood_row("Surface Water", flood_risk.get("surface_water")),
         ("Direct Link",   link(f"https://check-long-term-flood-risk.service.gov.uk/postcode?postcode={pc_enc}",
                                "check-long-term-flood-risk.service.gov.uk"), "", None),
-    ], note="EA flood risk service requires CAPTCHA verification — follow the link above.",
+    ], note="From the EA's National Flood Risk Assessment (NaFRA2) and Risk of Flooding from Surface Water "
+            "datasets — for a full breakdown (defences, historic flooding) use the direct link above.",
     col_widths=(40*mm, 98*mm, 20*mm))
 
     # Radon
