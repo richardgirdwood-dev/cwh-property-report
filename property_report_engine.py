@@ -63,20 +63,44 @@ def link(url, text=None):
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
 def fetch_postcode(postcode):
-    """Returns lat, lng, admin_district, county, region from postcodes.io"""
+    """Returns lat, lng, admin_district, county, region, parish from postcodes.io.
+    Retries before giving up: a single transient failure here aborts the whole
+    report (callers treat lat=None as unresolvable), which has silently dropped
+    reports in batch runs."""
     pc = postcode.replace(" ", "")
-    try:
-        r = requests.get(f"https://api.postcodes.io/postcodes/{pc}", timeout=10)
-        d = r.json()["result"]
-        return {
-            "lat":    d["latitude"],
-            "lng":    d["longitude"],
-            "la":     d["admin_district"],
-            "county": d.get("admin_county") or "",
-            "region": d.get("region") or "",
-        }
-    except Exception:
-        return {"lat": None, "lng": None, "la": "Unknown", "county": "", "region": ""}
+    for attempt in range(3):
+        try:
+            r = requests.get(f"https://api.postcodes.io/postcodes/{pc}", timeout=10)
+            d = r.json()["result"]
+            return {
+                "lat":    d["latitude"],
+                "lng":    d["longitude"],
+                "la":     d["admin_district"],
+                "county": d.get("admin_county") or "",
+                "region": d.get("region") or "",
+                "parish": d.get("parish") or "",
+            }
+        except Exception:
+            if attempt < 2:
+                time.sleep(2)
+    return {"lat": None, "lng": None, "la": "Unknown", "county": "", "region": "",
+            "parish": ""}
+
+def _local_place_name(pc_data, address):
+    """Best available name for the property's own settlement/town, for the
+    draft Facilities paragraph — prefers postcodes.io's civil parish (most
+    accurate for villages, e.g. 'Heacham'), falling back to the local
+    authority district, then to the address string. 'parish' is often
+    'Unparished Area' in cities; the district ('Cambridge') is used there
+    rather than the electoral ward, since ward names are sub-settlement
+    areas ('De Freville') that don't read as a place in a report."""
+    parish = pc_data.get("parish") or ""
+    if parish and "unparished" not in parish.lower():
+        return parish
+    district = pc_data.get("la") or ""
+    if district and district != "Unknown":
+        return district
+    return address.split(",")[-1].strip() if "," in address else address
 
 def fetch_radon_status(lat, lng):
     """Returns (status_text, (badge_hex, badge_label)) from UKHSA live radon data via ArcGIS."""
@@ -280,36 +304,34 @@ def _school_phrase(schools):
     else:
         return "a school" if len(schools) == 1 else "schools"
 
-def _facilities_narrative(address, schools, amenities, stations, known_place=None):
-    """Build a 'Facilities' paragraph from real amenities/schools/rail data —
-    states only whether these facilities are present locally, not their names,
-    and does not invent roads or distances to towns the tool has no data for.
+def _facilities_narrative(address, schools, amenities, stations, known_place=None,
+                           wider_place=None, trunk_road=None):
+    """Build a tight 'Facilities' paragraph from real amenities/schools/rail/
+    road data — states only whether these facility categories are present
+    locally, not individual business/school names.
 
     known_place: a real, geocoded settlement name (e.g. from the conservation
     area lookup) to use instead of guessing from the address string — the
     last comma-separated part of a multi-part address is often the county
-    (e.g. "Rutland"), not the actual village."""
+    (e.g. "Rutland"), not the actual village.
+    wider_place, trunk_road: the nearest larger settlement and the nearest
+    trunk/primary road, both from fetch_road_and_larger_place — used for the
+    "a wider range of amenities are available in X" and transport sentences."""
     if known_place:
         town = known_place
     else:
         town = address.split(",")[-1].strip() if "," in address else address
 
     categories = []
-    if amenities.get("pubs"):
-        categories.append("public houses")
     if amenities.get("shops"):
-        categories.append("local shops")
+        categories.append("retail offerings")
     if amenities.get("doctors"):
-        categories.append("a doctors' surgery")
+        categories.append("healthcare facilities")
     if schools:
         categories.append(_school_phrase(schools))
 
     if categories:
-        para = (
-            f"The property is located within or close to {town}, which provides "
-            f"{_join_list(categories)} (source: OpenStreetMap — please verify current "
-            f"provision)."
-        )
+        para = f"{town} offers a range of convenient amenities including {_join_list(categories)}."
     else:
         para = (
             f"No significant local amenities were identified within the immediate vicinity "
@@ -317,13 +339,16 @@ def _facilities_narrative(address, schools, amenities, stations, known_place=Non
             f"detail here."
         )
 
-    # Trunk road isn't in any of the tool's data sources — always left as a
-    # placeholder. Station name is filled in when known, otherwise also
-    # left as a placeholder rather than dropping the sentence.
+    if wider_place:
+        para += f" A wider range of amenities are available in {wider_place}."
+
+    # Both pieces fall back to a placeholder rather than dropping the
+    # sentence, since the transport sentence should always be present.
+    road_label = trunk_road or "[INSERT ROAD]"
     station_name = stations[0][0] if stations else "[INSERT LOCATION]"
     para += (
-        f" There are good transport links further afield via the railway station in "
-        f"{station_name} and the nearby [INSERT ROAD] trunk road."
+        f" There are good transport links further afield via the {road_label} trunk road "
+        f"and the railway station at {station_name}."
     )
 
     return para
@@ -354,7 +379,12 @@ def generate_draft_paragraph(address, postcode):
     stations = fetch_rail_stations(lat, lng)
 
     ca_name = _clean_conservation_name(conservation_area) if conservation_area else None
-    facilities_para = _facilities_narrative(address, schools, amenities, stations, known_place=ca_name)
+    town_name = ca_name or _local_place_name(pc_data, address)
+    trunk_road, wider_place = fetch_road_and_larger_place(lat, lng, town_name)
+    facilities_para = _facilities_narrative(
+        address, schools, amenities, stations, known_place=town_name,
+        wider_place=wider_place, trunk_road=trunk_road,
+    )
 
     lines = []
 
@@ -600,21 +630,90 @@ def _overpass(query, timeout=30, retries=2):
     return {"elements": []}
 
 def fetch_rail_stations(lat, lng):
-    """Returns up to 4 nearest stations with distances."""
+    """Returns up to 4 nearest National Rail stations with distances.
+
+    Only stations with a CRS code (the 3-letter National Rail code, e.g. CBG)
+    are kept, which excludes heritage/tourist railways, Underground/metro,
+    tram and miniature railway stops."""
     try:
-        query = f"[out:json][timeout:30];node[railway=station](around:20000,{lat},{lng});out;"
+        query = (f'[out:json][timeout:30];nwr[railway=station]["ref:crs"]'
+                 f'(around:20000,{lat},{lng});out center tags;')
         data = _overpass(query)
-        stations = []
+        nearest = {}
         for el in data.get("elements", []):
-            name = el.get("tags", {}).get("name", "")
-            if not name:
+            tags = el.get("tags", {})
+            name = tags.get("name", "")
+            if not name or tags.get("usage") == "tourism" or tags.get("railway:preserved") == "yes":
                 continue
-            dist = haversine_miles(lat, lng, el["lat"], el["lon"])
-            stations.append((name, dist))
-        stations.sort(key=lambda x: x[1])
+            # Underground/metro stops can carry pseudo-CRS codes (e.g. ZOC) too
+            if tags.get("station") in ("subway", "light_rail", "monorail", "miniature", "funicular"):
+                continue
+            plat = el.get("lat", el.get("center", {}).get("lat"))
+            plon = el.get("lon", el.get("center", {}).get("lon"))
+            if plat is None or plon is None:
+                continue
+            dist = haversine_miles(lat, lng, plat, plon)
+            crs = tags["ref:crs"]
+            if crs not in nearest or dist < nearest[crs][1]:
+                nearest[crs] = (name, dist)
+        stations = sorted(nearest.values(), key=lambda x: x[1])
         return stations[:4]
     except Exception:
         return []
+
+PLACE_RANK = {"city": 4, "town": 3, "suburb": 2, "village": 2, "hamlet": 1, "locality": 1}
+
+def fetch_road_and_larger_place(lat, lng, current_town):
+    """One Overpass call for both extras the draft Facilities paragraph wants:
+    the nearest trunk/primary road (returned as its number, e.g. 'A149') and
+    the nearest settlement larger than the property's own (for the 'a wider
+    range of amenities are available in X' sentence).
+
+    Deliberately a short timeout with no retry: both only enrich the
+    paragraph and fall back cleanly, so when the free mirrors throttle it is
+    far better to give up in seconds than to stall the whole report for
+    minutes retrying — which is exactly what a 2-query, full-retry version
+    of this did in batch runs.
+
+    Returns (road_label_or_None, larger_place_name_or_None)."""
+    query = (
+        f"[out:json][timeout:15];"
+        f"("
+        f"way[highway~'^(trunk|primary)$'](around:8000,{lat},{lng});"
+        f"node[place](around:20000,{lat},{lng});"
+        f");out tags center;"
+    )
+    try:
+        data = _overpass(query, timeout=15, retries=1)
+    except Exception:
+        return None, None
+
+    roads = []
+    candidates = []
+    current_rank = None
+    for el in data.get("elements", []):
+        tags = el.get("tags", {})
+        name = tags.get("name", "")
+        if tags.get("highway"):
+            label = tags.get("ref", "").split(";")[0].strip() or name
+            center = el.get("center") or {}
+            if label and center.get("lat") is not None:
+                roads.append((label, haversine_miles(lat, lng, center["lat"], center["lon"])))
+        elif tags.get("place") in PLACE_RANK and name:
+            dist = haversine_miles(lat, lng, el["lat"], el["lon"])
+            if current_town and name.lower() == current_town.lower():
+                current_rank = PLACE_RANK[tags["place"]]
+            else:
+                candidates.append((name, PLACE_RANK[tags["place"]], dist))
+
+    road = min(roads, key=lambda r: r[1])[0] if roads else None
+
+    if current_rank is None:
+        current_rank = PLACE_RANK["village"]
+    if current_rank >= PLACE_RANK["town"]:
+        return road, None
+    larger = sorted((c for c in candidates if c[1] > current_rank), key=lambda c: c[2])
+    return road, (larger[0][0] if larger else None)
 
 def _wgs84_to_osgb(lat, lon):
     """Approximate WGS84 -> OSGB36 easting/northing (accurate to ~1 m for England)."""
