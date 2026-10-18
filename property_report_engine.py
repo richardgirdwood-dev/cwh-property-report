@@ -17,7 +17,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, Image
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, Image, KeepTogether
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 
 LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cwh_logo.png")
@@ -384,36 +384,62 @@ OVERPASS_HEADERS = {
 }
 OVERPASS_MIRRORS = [
     "https://overpass-api.de/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
 ]
 
-def _overpass(query, timeout=30, retries=2):
+def _overpass(query, timeout=100, retries=3):
     """POST an Overpass query, trying every mirror, and retrying the whole
     mirror list up to `retries` times if all of them fail first time round —
     the free Overpass mirrors intermittently time out or rate-limit, and a
-    short retry clears most of those transient failures."""
+    short retry clears most of those transient failures.
+
+    Two silent-failure traps this guards against:
+      * A busy server can take 30s+ just to start a query, so a short client
+        timeout makes every attempt fail. Queries should carry a server-side
+        [timeout:90] and this waits up to `timeout` seconds for the answer.
+      * Overpass answers HTTP 200 with an empty `elements` list and a
+        `remark` like "runtime error: Query timed out" when it gives up part
+        way. That is a failure, not "nothing nearby", so it is retried.
+    """
     for attempt in range(retries):
         for url in OVERPASS_MIRRORS:
             try:
                 r = requests.post(url, data={"data": query},
                                   headers=OVERPASS_HEADERS, timeout=timeout)
-                if r.status_code == 200 and r.text.strip():
-                    return r.json()
+                if r.status_code != 200 or not r.text.strip().startswith("{"):
+                    continue
+                data = r.json()
+                remark = (data.get("remark") or "").lower()
+                if "error" in remark or "timed out" in remark or "out of memory" in remark:
+                    continue
+                return data
             except Exception:
                 continue
         if attempt < retries - 1:
-            time.sleep(3)
+            time.sleep(5 * (attempt + 1))
     return {"elements": []}
 
+
+def _el_latlng(el):
+    """Coordinates of an Overpass node, or the centre of a way/relation."""
+    la = el.get("lat")
+    lo = el.get("lon")
+    if la is None:
+        c = el.get("center") or {}
+        la, lo = c.get("lat"), c.get("lon")
+    return la, lo
+
 def fetch_rail_stations(lat, lng):
-    """Returns up to 4 nearest National Rail stations with distances.
+    """Returns up to 4 nearest National Rail stations as
+    (name, distance_miles, lat, lng) tuples.
 
     Only stations with a CRS code (the 3-letter National Rail code, e.g. CBG)
     are kept, which excludes heritage/tourist railways, Underground/metro,
     tram and miniature railway stops."""
     try:
-        query = (f'[out:json][timeout:30];nwr[railway=station]["ref:crs"]'
+        query = (f'[out:json][timeout:90];nwr[railway=station]["ref:crs"]'
                  f'(around:20000,{lat},{lng});out center tags;')
         data = _overpass(query)
         nearest = {}
@@ -432,7 +458,7 @@ def fetch_rail_stations(lat, lng):
             dist = haversine_miles(lat, lng, plat, plon)
             crs = tags["ref:crs"]
             if crs not in nearest or dist < nearest[crs][1]:
-                nearest[crs] = (name, dist)
+                nearest[crs] = (name, dist, plat, plon)
         stations = sorted(nearest.values(), key=lambda x: x[1])
         return stations[:4]
     except Exception:
@@ -619,54 +645,103 @@ def assess_clay_soil(geology, soil_texture=None):
 SHOP_TYPES = {"supermarket", "convenience", "general", "department_store", "mall"}
 
 def fetch_schools_and_amenities(lat, lng):
-    """Single Overpass query for schools, shops, GPs, and pubs — avoids rate-limit issues."""
-    query = (
-        f"[out:json][timeout:30];"
-        f"("
-        f"node[amenity=school](around:3000,{lat},{lng});"
-        f"way[amenity=school](around:3000,{lat},{lng});"
-        f"node[shop](around:3000,{lat},{lng});"
-        f"way[shop](around:3000,{lat},{lng});"
-        f"node[amenity=doctors](around:6000,{lat},{lng});"
-        f"way[amenity=doctors](around:6000,{lat},{lng});"
-        f"node[amenity=pub](around:2000,{lat},{lng});"
-        f"way[amenity=pub](around:2000,{lat},{lng});"
-        f");out tags center;"
-    )
-    schools = []
-    amenities = {"shops": [], "doctors": [], "pubs": []}
-    try:
-        data = _overpass(query)
-        seen_schools = set()
-        for el in data.get("elements", []):
+    """Schools, shops, GPs and pubs from OpenStreetMap.
+
+    Run as four small queries, two at a time (the public Overpass servers allow
+    two concurrent requests per client), rather than one large one. The old
+    single query asked for every shop of any kind within 3 km. In a town that
+    is thousands of features, and on a busy server it timed out and the
+    report silently said "No amenity data found nearby". Shop types are now
+    filtered server-side.
+
+    Every result keeps its coordinates (`lat`, `lng`) for the location map."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    shop_re = "|".join(sorted(SHOP_TYPES))
+    queries = {
+        "schools": f'nwr[amenity=school](around:3000,{lat},{lng});',
+        "shops":   f'nwr[shop~"^({shop_re})$"](around:3000,{lat},{lng});',
+        "doctors": f'nwr[amenity=doctors](around:6000,{lat},{lng});',
+        "pubs":    f'nwr[amenity=pub](around:2000,{lat},{lng});',
+    }
+
+    def run(body):
+        return _overpass(f"[out:json][timeout:90];({body});out tags center;")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = dict(zip(queries, pool.map(run, queries.values())))
+
+    def items(key):
+        out = []
+        for el in results.get(key, {}).get("elements", []):
             tags = el.get("tags", {})
             name = tags.get("name", "")
             if not name:
                 continue
-            el_lat = el.get("lat") or (el.get("center") or {}).get("lat")
-            el_lng = el.get("lon") or (el.get("center") or {}).get("lon")
-            dist = haversine_miles(lat, lng, el_lat, el_lng) if el_lat else None
-            amenity_tag = tags.get("amenity", "")
-            shop_tag    = tags.get("shop", "")
-            if amenity_tag == "school" and name not in seen_schools:
-                seen_schools.add(name)
-                schools.append({
-                    "name": name,
-                    "dist": dist,
-                    "url":  f"https://reports.ofsted.gov.uk/search?q={requests.utils.quote(name)}",
-                })
-            elif shop_tag in SHOP_TYPES:
-                amenities["shops"].append({"name": name, "dist": dist})
-            elif amenity_tag == "doctors":
-                amenities["doctors"].append({"name": name, "dist": dist})
-            elif amenity_tag == "pub":
-                amenities["pubs"].append({"name": name, "dist": dist})
-    except Exception:
-        pass
-    schools.sort(key=lambda x: x["dist"] or 99)
-    for key in amenities:
-        amenities[key].sort(key=lambda x: x["dist"] or 99)
+            el_lat, el_lng = _el_latlng(el)
+            dist = haversine_miles(lat, lng, el_lat, el_lng) if el_lat is not None else None
+            out.append({"name": name, "dist": dist, "lat": el_lat, "lng": el_lng, "tags": tags})
+        out.sort(key=lambda x: x["dist"] if x["dist"] is not None else 99)
+        return out
+
+    schools, seen = [], set()
+    for s in items("schools"):
+        if s["name"] in seen:
+            continue
+        seen.add(s["name"])
+        s["url"] = f"https://reports.ofsted.gov.uk/search?q={requests.utils.quote(s['name'])}"
+        schools.append(s)
+
+    amenities = {"shops": items("shops"), "doctors": items("doctors"), "pubs": items("pubs")}
     return schools[:6], amenities
+
+
+def _rdp(points, eps):
+    """Douglas-Peucker line simplification on (x, y) points."""
+    if len(points) < 3:
+        return points
+    (x1, y1), (x2, y2) = points[0], points[-1]
+    dx, dy = x2 - x1, y2 - y1
+    norm = math.hypot(dx, dy) or 1e-12
+    dmax, idx = 0.0, 0
+    for i in range(1, len(points) - 1):
+        px, py = points[i]
+        d = abs(dx * (py - y1) - dy * (px - x1)) / norm
+        if d > dmax:
+            dmax, idx = d, i
+    if dmax > eps:
+        return _rdp(points[:idx + 1], eps)[:-1] + _rdp(points[idx:], eps)
+    return [points[0], points[-1]]
+
+
+def fetch_map_roads(lat, lng, radius_m):
+    """Road, rail and river lines around the property for the location map
+    basemap, as [{"c": class, "g": [(lat, lng), ...]}]. Minor roads are only
+    included when the map is zoomed in, to keep the query and the PDF small.
+    Returns [] on failure; the map is still drawn, just without a basemap."""
+    classes = "motorway|trunk|primary|secondary|tertiary"
+    if radius_m <= 3500:
+        classes += "|unclassified|residential"
+    r = int(radius_m)
+    query = (f"[out:json][timeout:120];("
+             f'way[highway~"^({classes})$"](around:{r},{lat},{lng});'
+             f"way[railway=rail](around:{r},{lat},{lng});"
+             f'way[waterway~"^(river|canal)$"](around:{r},{lat},{lng});'
+             f");out geom;")
+    try:
+        data = _overpass(query, timeout=150)
+    except Exception:
+        return []
+    k = math.cos(math.radians(lat))
+    out = []
+    for el in data.get("elements", []):
+        tags = el.get("tags", {})
+        cls = tags.get("highway") or ("rail" if tags.get("railway") else "river")
+        pts = [(p["lon"] * k, p["lat"]) for p in el.get("geometry", []) if "lat" in p]
+        pts = _rdp(pts, 0.00006)          # ~7 m
+        if len(pts) > 1:
+            out.append({"c": cls, "g": [(y, x / k) for x, y in pts]})
+    return out
 
 # ── PDF BUILDER ────────────────────────────────────────────────────────────────
 
@@ -708,6 +783,313 @@ def _section(story, icon, title, rows, note=None, col_widths=(45*mm, 100*mm, 35*
         story.append(Spacer(1, 1*mm))
         story.append(Paragraph(note, NOTE))
     story.append(Spacer(1, 3.5*mm))
+
+# ── LOCATION MAP ───────────────────────────────────────────────────────────────
+
+MAP_SCHOOL  = PURPLE
+MAP_SHOP    = MID_BLUE
+MAP_GP      = GREEN
+MAP_PUB     = AMBER
+MAP_STATION = TEAL
+MAP_PROPERTY = RED
+
+_ROAD_STYLE = {  # class -> (stroke width pt, colour, draw order)
+    "motorway": (2.4, "#C8B48A", 3), "trunk": (2.2, "#C8B48A", 3),
+    "primary": (1.9, "#D4C09A", 3), "secondary": (1.5, "#D9CBB0", 3),
+    "tertiary": (1.1, "#CFCFCF", 2), "unclassified": (0.6, "#DEDEDE", 1),
+    "residential": (0.5, "#E2E2E2", 1), "rail": (0.9, "#8A8A8A", 2),
+    "river": (1.2, "#9CC3E6", 0),
+}
+_MI = 1609.344
+
+
+def _short(text, n):
+    """Truncate to n characters with an ellipsis."""
+    return text if len(text) <= n else text[:n - 1].rstrip() + "\u2026"
+
+
+def _pin_label(num, color):
+    """Coloured map-pin number to prefix a table row label ('' if not pinned)."""
+    if not num:
+        return ""
+    return f'<font color="{color.hexval().replace("0x", "#")}"><b>{num}</b></font>&nbsp;&nbsp;'
+
+
+def _project_m(lat, lng, lat0, lng0):
+    """Local equirectangular projection to metres east/north of the property."""
+    x = math.radians(lng - lng0) * 6371000.0 * math.cos(math.radians(lat0))
+    y = math.radians(lat - lat0) * 6371000.0
+    return x, y
+
+
+def _clip_segment(x1, y1, x2, y2, xmin, ymin, xmax, ymax):
+    """Liang-Barsky clip of one segment to a rectangle; None if outside."""
+    dx, dy = x2 - x1, y2 - y1
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, x1 - xmin), (dx, xmax - x1), (-dy, y1 - ymin), (dy, ymax - y1)):
+        if p == 0:
+            if q < 0:
+                return None
+        else:
+            t = q / p
+            if p < 0:
+                if t > t1:
+                    return None
+                t0 = max(t0, t)
+            else:
+                if t < t0:
+                    return None
+                t1 = min(t1, t)
+    return (x1 + t0 * dx, y1 + t0 * dy, x1 + t1 * dx, y1 + t1 * dy)
+
+
+def _spread(points, min_sep, fixed=0):
+    """Nudge overlapping pin positions apart. The first `fixed` points never move."""
+    pos = [list(p) for p in points]
+    for _ in range(80):
+        moved = False
+        for a in range(len(pos)):
+            for b in range(a + 1, len(pos)):
+                dx, dy = pos[b][0] - pos[a][0], pos[b][1] - pos[a][1]
+                d = math.hypot(dx, dy)
+                if d >= min_sep:
+                    continue
+                if d < 1e-6:
+                    dx, dy, d = 1.0, 0.3, math.hypot(1.0, 0.3)
+                push = (min_sep - d) + 0.5
+                ux, uy = dx / d, dy / d
+                if a < fixed and b < fixed:
+                    continue
+                if a < fixed:
+                    pos[b][0] += ux * push; pos[b][1] += uy * push
+                elif b < fixed:
+                    pos[a][0] -= ux * push; pos[a][1] -= uy * push
+                else:
+                    pos[a][0] -= ux * push / 2; pos[a][1] -= uy * push / 2
+                    pos[b][0] += ux * push / 2; pos[b][1] += uy * push / 2
+                moved = True
+        if not moved:
+            break
+    return pos
+
+
+def _map_frame(pins, lat0, lng0):
+    """(cx, cy, half) in metres: a square window framing the property and the
+    local pins. Pins further than 2.5 km that are rail stations are allowed to
+    fall off the edge (they get an arrow) so one distant station doesn't shrink
+    the whole map."""
+    pts = [(0.0, 0.0)]
+    for p in pins:
+        if p["dist"] is None:
+            continue
+        if p.get("kind") == "station" and p["dist"] * _MI > 2500:
+            continue
+        pts.append(_project_m(p["lat"], p["lng"], lat0, lng0))
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+    half = max(max(xs) - min(xs), max(ys) - min(ys)) / 2 * 1.12 + 250
+    half = min(max(half, 700), 9000)
+    cx = max(min(cx, half * 0.72), -half * 0.72)   # keep the property well inside
+    cy = max(min(cy, half * 0.72), -half * 0.72)
+    return cx, cy, half
+
+
+def map_fetch_radius(pins, lat0, lng0):
+    """Radius (m) from the property needed to cover the whole map window."""
+    cx, cy, half = _map_frame(pins, lat0, lng0)
+    return math.hypot(abs(cx) + half, abs(cy) + half) + 100
+
+
+def build_location_map(lat0, lng0, pins, roads, width=180*mm, height=118*mm):
+    """Vector location map as a ReportLab Drawing.
+
+    pins: [{"num", "lat", "lng", "dist" (miles), "color", "kind"}], numbered to
+    match the schools / amenities / stations tables. roads: from fetch_map_roads."""
+    from reportlab.graphics.shapes import Drawing, Rect, PolyLine, Circle, String, Line, Polygon
+
+    pins = [p for p in pins if p.get("lat") is not None and p.get("lng") is not None]
+    cx, cy, half = _map_frame(pins, lat0, lng0)
+    # non-square drawing: widen the window horizontally to fill it
+    hx = half * max(1.0, width / height)
+    hy = half * max(1.0, height / width)
+    xmin, xmax, ymin, ymax = cx - hx, cx + hx, cy - hy, cy + hy
+    sx = width / (xmax - xmin)
+    sy = height / (ymax - ymin)
+    s = min(sx, sy)
+
+    def to_pt(x, y):
+        return (x - xmin) * s, (y - ymin) * s
+
+    d = Drawing(width, height)
+    d.add(Rect(0, 0, width, height, fillColor=colors.HexColor("#F7F6F2"),
+               strokeColor=colors.HexColor("#BBBBBB"), strokeWidth=0.6))
+
+    # basemap
+    for rd in sorted(roads or [], key=lambda r: _ROAD_STYLE.get(r["c"], (0, "", 1))[2]):
+        w, col, _ = _ROAD_STYLE.get(rd["c"], (0.5, "#E5E5E5", 1))
+        xy = [_project_m(a, b, lat0, lng0) for a, b in rd["g"]]
+        run = []
+        for (x1, y1), (x2, y2) in zip(xy, xy[1:]):
+            seg = _clip_segment(x1, y1, x2, y2, xmin, ymin, xmax, ymax)
+            if seg is None:
+                if len(run) > 2:
+                    d.add(PolyLine(run, strokeColor=colors.HexColor(col), strokeWidth=w,
+                                   strokeLineCap=1, strokeLineJoin=1,
+                                   strokeDashArray=[3, 1.5] if rd["c"] == "rail" else None))
+                run = []
+                continue
+            a = to_pt(seg[0], seg[1]); b = to_pt(seg[2], seg[3])
+            if run and abs(run[-2] - a[0]) < 0.01 and abs(run[-1] - a[1]) < 0.01:
+                run += [b[0], b[1]]
+            else:
+                if len(run) > 2:
+                    d.add(PolyLine(run, strokeColor=colors.HexColor(col), strokeWidth=w,
+                                   strokeLineCap=1, strokeLineJoin=1,
+                                   strokeDashArray=[3, 1.5] if rd["c"] == "rail" else None))
+                run = [a[0], a[1], b[0], b[1]]
+        if len(run) > 2:
+            d.add(PolyLine(run, strokeColor=colors.HexColor(col), strokeWidth=w,
+                           strokeLineCap=1, strokeLineJoin=1,
+                           strokeDashArray=[3, 1.5] if rd["c"] == "rail" else None))
+
+    # distance rings (miles), centred on the property
+    px0, py0 = to_pt(0, 0)
+    span_mi = max(hx, hy) / _MI
+    rings = [0.25, 0.5, 0.75, 1] if span_mi < 1.2 else \
+            [0.5, 1, 1.5, 2] if span_mi < 2.6 else [1, 2, 3, 4, 5]
+    for r_mi in rings:
+        rpt = r_mi * _MI * s
+        far = max(math.hypot(px0 - cxp, py0 - cyp) for cxp in (0, width) for cyp in (0, height))
+        if rpt > far:
+            continue
+        # drawn as a clipped polyline: ReportLab drawings don't clip to their bounds
+        ring = [(px0 + rpt * math.cos(math.radians(a)), py0 + rpt * math.sin(math.radians(a)))
+                for a in range(0, 361, 3)]
+        run = []
+        for (x1, y1), (x2, y2) in zip(ring, ring[1:]):
+            seg = _clip_segment(x1, y1, x2, y2, 0, 0, width, height)
+            if seg is None:
+                if len(run) > 2:
+                    d.add(PolyLine(run, strokeColor=colors.HexColor("#A0A0A0"), strokeWidth=0.5,
+                                   strokeDashArray=[1.5, 2]))
+                run = []
+                continue
+            if not run:
+                run = [seg[0], seg[1]]
+            run += [seg[2], seg[3]]
+        if len(run) > 2:
+            d.add(PolyLine(run, strokeColor=colors.HexColor("#A0A0A0"), strokeWidth=0.5,
+                           strokeDashArray=[1.5, 2]))
+        for ang in (-40, -140, 40, -90, 140, 0, 180):
+            lx = px0 + rpt * math.cos(math.radians(ang))
+            ly = py0 + rpt * math.sin(math.radians(ang))
+            if 6 < lx < width - 22 and 6 < ly < height - 8 and not (lx < 52 * mm and ly > height - 24 * mm):
+                lab = f"{r_mi:g} mi"
+                d.add(Rect(lx + 1, ly - 7.5, len(lab) * 3.4 + 2, 8, fillColor=colors.HexColor("#F7F6F2"),
+                           strokeColor=None))
+                d.add(String(lx + 2, ly - 5.5, lab, fontName="Helvetica", fontSize=6,
+                             fillColor=colors.HexColor("#777777")))
+                break
+
+    # pins: on-map ones are spread apart (with a leader line to the true spot);
+    # off-map ones become an arrow at the edge with their number and distance
+    R = 5.2   # pin radius (pt)
+    on, off = [], []
+    for p in pins:
+        x, y = to_pt(*_project_m(p["lat"], p["lng"], lat0, lng0))
+        (on if 3 < x < width - 3 and 3 < y < height - 3 else off).append((p, x, y))
+
+    placed = _spread([(px0, py0)] + [(x, y) for _, x, y in on], min_sep=2 * R + 1.5, fixed=1)[1:]
+    for (p, tx, ty), (x, y) in zip(on, placed):
+        x = min(max(x, R + 1), width - R - 1)
+        y = min(max(y, R + 1), height - R - 1)
+        col = p["color"]
+        if math.hypot(x - tx, y - ty) > 1.5:
+            d.add(Line(tx, ty, x, y, strokeColor=col, strokeWidth=0.6))
+            d.add(Circle(tx, ty, 1.3, fillColor=col, strokeColor=None))
+        d.add(Circle(x, y, R, fillColor=col, strokeColor=colors.white, strokeWidth=0.8))
+        n = str(p["num"])
+        d.add(String(x, y - 2.3, n, fontName="Helvetica-Bold", fontSize=6.3 if len(n) < 2 else 5.6,
+                     fillColor=colors.white, textAnchor="middle"))
+
+    labels = []
+    for p, x, y in off:
+        ux, uy = x - px0, y - py0
+        n = math.hypot(ux, uy) or 1.0
+        ux, uy = ux / n, uy / n
+        ts = []
+        for u, lo, hi, c0 in ((ux, 4, width - 4, px0), (uy, 4, height - 4, py0)):
+            if abs(u) > 1e-9:
+                ts.append(((hi if u > 0 else lo) - c0) / u)
+        t = min(t for t in ts if t > 0)
+        ex, ey = px0 + ux * t, py0 + uy * t
+        labels.append([p, ex, ey, ex - ux * 26, ey - uy * 26])
+    lab_pos = _spread([(l[3], l[4]) for l in labels], min_sep=13)
+    for (p, ex, ey, _, _), (lx, ly) in zip(labels, lab_pos):
+        col = p["color"]
+        d.add(Line(lx, ly, ex, ey, strokeColor=col, strokeWidth=1))
+        ang = math.atan2(ey - ly, ex - lx)
+        hx_, hy_ = math.cos(ang), math.sin(ang)
+        d.add(Polygon([ex, ey, ex - 5 * hx_ + 2.5 * hy_, ey - 5 * hy_ - 2.5 * hx_,
+                       ex - 5 * hx_ - 2.5 * hy_, ey - 5 * hy_ + 2.5 * hx_],
+                      fillColor=col, strokeColor=None))
+        txt = f"{p['num']}  {p['dist']:.1f} mi"
+        tw = len(txt) * 3.3 + 6
+        d.add(Rect(lx - tw / 2, ly - 5, tw, 10, rx=2, ry=2, fillColor=colors.white,
+                   strokeColor=col, strokeWidth=0.6))
+        d.add(String(lx, ly - 2.3, txt, fontName="Helvetica-Bold", fontSize=6.3,
+                     fillColor=col, textAnchor="middle"))
+
+    # property star
+    pts = []
+    for i in range(10):
+        r = 7.5 if i % 2 == 0 else 3.2
+        a = math.radians(90 + i * 36)
+        pts += [px0 + r * math.cos(a), py0 + r * math.sin(a)]
+    d.add(Polygon(pts, fillColor=MAP_PROPERTY, strokeColor=colors.white, strokeWidth=0.8))
+
+    # north arrow
+    nx, ny = width - 12, height - 30
+    d.add(Polygon([nx, ny + 16, nx - 4, ny + 6, nx + 4, ny + 6], fillColor=DARK_BLUE, strokeColor=None))
+    d.add(Line(nx, ny, nx, ny + 8, strokeColor=DARK_BLUE, strokeWidth=1.2))
+    d.add(String(nx, ny - 8, "N", fontName="Helvetica-Bold", fontSize=8, fillColor=DARK_BLUE,
+                 textAnchor="middle"))
+
+    # scale bar (miles)
+    bar_mi = next(b for b in (2, 1, 0.5, 0.25, 0.1) if b * _MI * s <= width / 4)
+    blen = bar_mi * _MI * s
+    d.add(Rect(8, 6, blen + 8, 15, fillColor=colors.HexColor("#F7F6F2"), strokeColor=None))
+    d.add(Line(12, 10, 12 + blen, 10, strokeColor=TEXT, strokeWidth=1.6))
+    d.add(Line(12, 8, 12, 12, strokeColor=TEXT, strokeWidth=0.8))
+    d.add(Line(12 + blen, 8, 12 + blen, 12, strokeColor=TEXT, strokeWidth=0.8))
+    d.add(String(12 + blen / 2, 13.5, f"{bar_mi:g} mile" + ("" if bar_mi == 1 else "s"),
+                 fontName="Helvetica", fontSize=6.5, fillColor=TEXT, textAnchor="middle"))
+
+    # legend
+    kinds = [("Property", MAP_PROPERTY, "star")]
+    for kind, label, col in (("school", "Schools", MAP_SCHOOL), ("shop", "Shops", MAP_SHOP),
+                             ("gp", "GP", MAP_GP), ("pub", "Pubs", MAP_PUB),
+                             ("station", "Rail stations", MAP_STATION)):
+        if any(p.get("kind") == kind for p in pins):
+            kinds.append((label, col, "dot"))
+    lw, lh = 30 * mm, 4 + 9 * len(kinds)
+    lx0, ly0 = 5, height - 5 - lh
+    d.add(Rect(lx0, ly0, lw, lh, fillColor=colors.white, strokeColor=colors.HexColor("#D0D0D0"),
+               strokeWidth=0.5, fillOpacity=0.92))
+    for i, (label, col, mark) in enumerate(kinds):
+        yy = ly0 + lh - 8 - i * 9
+        if mark == "star":
+            st = []
+            for k in range(10):
+                r = 3.6 if k % 2 == 0 else 1.5
+                a = math.radians(90 + k * 36)
+                st += [lx0 + 7 + r * math.cos(a), yy + 1.5 + r * math.sin(a)]
+            d.add(Polygon(st, fillColor=col, strokeColor=None))
+        else:
+            d.add(Circle(lx0 + 7, yy + 1.5, 2.8, fillColor=col, strokeColor=None))
+        d.add(String(lx0 + 14, yy - 0.5, label, fontName="Helvetica", fontSize=6.8, fillColor=TEXT))
+
+    return d
 
 # ── MAIN ENTRY POINT ───────────────────────────────────────────────────────────
 
@@ -794,6 +1176,28 @@ def generate_report(address, postcode, output_path):
     soil_texture       = fetch_uk_soil_texture(lat, lng)
     geology            = fetch_bedrock_geology(lat, lng)
     schools, amenities = fetch_schools_and_amenities(lat, lng)
+
+    # Location map pins, numbered in the order the rows appear in the tables
+    # (schools, then shops / GPs / pubs, then the two nearest stations)
+    map_pins = []
+    def _pin(item, color, kind):
+        if item.get("lat") is None:
+            return None
+        n = len(map_pins) + 1
+        map_pins.append({"num": n, "lat": item["lat"], "lng": item["lng"],
+                         "dist": item.get("dist"), "color": color, "kind": kind})
+        return n
+    for sch in schools[:5]:
+        sch["num"] = _pin(sch, MAP_SCHOOL, "school")
+    for key, col, kind in (("shops", MAP_SHOP, "shop"), ("doctors", MAP_GP, "gp"),
+                           ("pubs", MAP_PUB, "pub")):
+        for item in amenities[key][:2]:
+            item["num"] = _pin(item, col, kind)
+    station_nums = []
+    for i, st_ in enumerate(stations):
+        station_nums.append(_pin({"lat": st_[2], "lng": st_[3], "dist": st_[1]},
+                                 MAP_STATION, "station") if i < 2 else None)
+    map_roads = fetch_map_roads(lat, lng, map_fetch_radius(map_pins, lat, lng))
 
     print(f"  Data fetched. Building PDF...")
 
@@ -1056,7 +1460,7 @@ def generate_report(address, postcode, output_path):
         for sch in schools[:5]:
             dist_text = f"{sch['dist']:.1f} mi" if sch.get("dist") is not None else ""
             sch_rows.append((
-                link(sch["url"], sch["name"][:32]),
+                _pin_label(sch.get("num"), MAP_SCHOOL) + link(sch["url"], sch["name"][:32]),
                 dist_text,
                 "",
                 None,
@@ -1072,15 +1476,15 @@ def generate_report(address, postcode, output_path):
     amenity_rows = []
     for shop in amenities["shops"][:2]:
         d = f"{shop['dist']:.1f} mi" if shop.get("dist") is not None else ""
-        amenity_rows.append((shop["name"][:32], d, "SHOP", MID_BLUE))
+        amenity_rows.append((_pin_label(shop.get("num"), MAP_SHOP) + _short(shop["name"], 27), d, "SHOP", MID_BLUE))
     for gp in amenities["doctors"][:2]:
         d = f"{gp['dist']:.1f} mi" if gp.get("dist") is not None else ""
-        amenity_rows.append((gp["name"][:32], d, "GP", GREEN))
+        amenity_rows.append((_pin_label(gp.get("num"), MAP_GP) + _short(gp["name"], 27), d, "GP", GREEN))
     for pub in amenities["pubs"][:2]:
         d = f"{pub['dist']:.1f} mi" if pub.get("dist") is not None else ""
-        amenity_rows.append((pub["name"][:32], d, "PUB", AMBER))
+        amenity_rows.append((_pin_label(pub.get("num"), MAP_PUB) + _short(pub["name"], 27), d, "PUB", AMBER))
     if amenity_rows:
-        amenities_block.append(_rows_table(amenity_rows, (50*mm, 15*mm, 12*mm)))
+        amenities_block.append(_rows_table(amenity_rows, (49*mm, 14*mm, 15*mm)))
     else:
         amenities_block.append(Paragraph("No amenity data found nearby.", NOTE))
     amenities_block.append(Paragraph("Source: OpenStreetMap — verify current trading status locally.", NOTE))
@@ -1100,8 +1504,9 @@ def generate_report(address, postcode, output_path):
         HRFlowable(width="100%", thickness=1.2, color=MID_BLUE, spaceAfter=2),
     ]
     if stations:
-        rail_rows = [(name, f"{dist:.1f} miles", "NEAREST" if i==0 else "", TEAL if i==0 else None)
-                     for i, (name, dist) in enumerate(stations)]
+        rail_rows = [(_pin_label(station_nums[i], MAP_STATION) + name, f"{dist:.1f} miles",
+                      "NEAREST" if i==0 else "", TEAL if i==0 else None)
+                     for i, (name, dist, _slat, _slng) in enumerate(stations)]
         rail_rows.append(("National Rail", link("www.nationalrail.co.uk"), "", None))
         rail_block.append(_rows_table(rail_rows, (35*mm, 43*mm, 18*mm)))
     else:
@@ -1144,6 +1549,25 @@ def generate_report(address, postcode, output_path):
     story.append(two_col3)
     story.append(Spacer(1, 4*mm))
 
+    # Location map — pins numbered to match the tables above
+    map_block = [
+        Paragraph("🗺  Location Map  (OpenStreetMap)", SECH),
+        HRFlowable(width="100%", thickness=1.2, color=MID_BLUE, spaceAfter=2),
+    ]
+    if map_pins:
+        map_block.append(build_location_map(lat, lng, map_pins, map_roads))
+        map_block.append(Spacer(1, 1*mm))
+        basemap_note = "" if map_roads else " Road basemap unavailable for this run."
+        map_block.append(Paragraph(
+            "Numbered pins match the schools, amenities and stations tables above; arrows point to "
+            "stations beyond the map edge. Rings are straight-line distances from the property."
+            f"{basemap_note} Map data © OpenStreetMap contributors, ODbL.", NOTE))
+    else:
+        map_block.append(Paragraph(
+            "Map unavailable — no location data was returned for this property from OpenStreetMap.", NOTE))
+    story.append(KeepTogether(map_block))
+    story.append(Spacer(1, 4*mm))
+
     # Bedrock & Superficial Geology
     bedrock     = geology.get("bedrock")
     superficial = geology.get("superficial")
@@ -1183,7 +1607,7 @@ def generate_report(address, postcode, output_path):
     story.append(HRFlowable(width="100%", thickness=0.4, color=colors.HexColor("#CCCCCC"), spaceAfter=2))
     story.append(Paragraph(
         "<b>Disclaimer:</b> This report is indicative only and generated from publicly available data sources "
-        "(Environment Agency, UKHSA, Cranfield University, Ofsted, National Rail, Rightmove / HM Land Registry, "
+        "(Environment Agency, UKHSA, Cranfield University, Ofsted, National Rail, OpenStreetMap, Rightmove / HM Land Registry, "
         f"Gov.uk EPC Register). It does not constitute a formal environmental search. "
         f"Data correct as at {today}.", DISC))
 
