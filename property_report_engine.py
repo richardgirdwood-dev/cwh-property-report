@@ -17,7 +17,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, Image
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, Image, KeepTogether, CondPageBreak
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 
 LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cwh_logo.png")
@@ -45,7 +45,7 @@ def S(name, **kw):
     # Unique name per call to avoid ReportLab style cache collisions
     return ParagraphStyle(f"{name}_{id(kw)}", parent=styles["Normal"], **kw)
 
-HDR  = S("HDR",  fontSize=20, textColor=WHITE,     fontName="Helvetica-Bold")
+HDR  = S("HDR",  fontSize=20, textColor=WHITE,     fontName="Helvetica-Bold", leading=24)
 SUB  = S("SUB",  fontSize=10, textColor=colors.HexColor("#BDD7EE"), fontName="Helvetica")
 SECH = S("SECH", fontSize=11, textColor=DARK_BLUE, fontName="Helvetica-Bold", spaceBefore=4, spaceAfter=2)
 LBL  = S("LBL",  fontSize=8,  textColor=GREY_TEXT, fontName="Helvetica-Bold")
@@ -298,7 +298,7 @@ def fetch_epc(postcode, house_number):
             "pot_rating":   pot_rating,
             "pot_score":    pot_score,
             "valid_until":  after_label("Valid until"),
-            "cert_date":    after_label("Certificate number", "N/A"),
+            "cert_date":    after_label("Date of certificate", after_label("Date of assessment")),
             "floor_area":   after_label("Total floor area"),
             "prop_type":    after_label("Property type"),
             "annual_cost":  in_sentence(r"spend\s*([\xc2\xa3\£]\S+\s+per year)", "N/A"),
@@ -307,6 +307,66 @@ def fetch_epc(postcode, house_number):
             "features":     features,
         }
     except Exception as e:
+        return None
+
+_PPD_TYPES   = {"D": "Detached", "S": "Semi-detached", "T": "Terraced", "F": "Flat", "O": "Other"}
+_PPD_TENURES = {"F": "Freehold", "L": "Leasehold"}
+
+def _norm_words(text):
+    return " " + re.sub(r"[^A-Z0-9 ]", " ", (text or "").upper()).replace("  ", " ") + " "
+
+def fetch_land_registry_sales(postcode, address):
+    """Sold prices for the subject property from HM Land Registry Price Paid
+    Data (official, free CSV endpoint). Much more reliable than scraping
+    Rightmove, and handles flats properly: Land Registry stores a flat's
+    number in SAON (e.g. "93") and the building in PAON (e.g. "THE ASH
+    BUILDING"), so both must appear in the address for a match."""
+    url = (f"https://landregistry.data.gov.uk/app/ppd/ppd_data.csv"
+           f"?postcode={postcode.replace(' ', '+')}&header=true&limit=all")
+    try:
+        import csv, io
+        r = requests.get(url, timeout=30, headers=HEADERS)
+        if r.status_code != 200:
+            return None
+        addr = _norm_words(address)
+        sales = []
+        for row in csv.DictReader(io.StringIO(r.text)):
+            if row.get("transaction_category") == "D":   # deleted/corrected records
+                continue
+            paon = _norm_words(row.get("paon")).strip()
+            saon = _norm_words(row.get("saon")).strip()
+            saon_core = re.sub(r"^(FLAT|APARTMENT|UNIT|APT)\s+", "", saon)
+            if not paon or f" {paon} " not in addr:
+                continue
+            if saon and f" {saon_core} " not in addr:
+                continue
+            parts = [p.title() for p in (row.get("saon"), row.get("paon")) if p]
+            street = (row.get("street") or "").title()
+            # "197 High Street" for a numbered house; "93 The Ash Building, Rudduck Way" for a named building
+            paon_txt = (row.get("paon") or "").strip()
+            sep = " " if re.match(r"^\d+[A-Z]?(-\d+[A-Z]?)?$", paon_txt) else ", "
+            label = " ".join(parts) + (f"{sep}{street}" if street else "")
+            try:
+                d = datetime.strptime(row["deed_date"][:10], "%Y-%m-%d")
+                date_txt = d.strftime("%d %b %Y").lstrip("0")
+            except Exception:
+                d, date_txt = None, row.get("deed_date", "")
+            try:
+                price_txt = f"£{int(row['price_paid']):,}"
+            except Exception:
+                price_txt = row.get("price_paid", "")
+            sales.append({
+                "address": label,
+                "date":    date_txt,
+                "price":   price_txt,
+                "type":    _PPD_TYPES.get(row.get("property_type"), "") +
+                           (" (new build)" if row.get("new_build") == "Y" else ""),
+                "tenure":  _PPD_TENURES.get(row.get("estate_type"), ""),
+                "_sort":   d or datetime.min,
+            })
+        sales.sort(key=lambda s: s["_sort"], reverse=True)
+        return sales
+    except Exception:
         return None
 
 def fetch_sales_history(postcode, house_number):
@@ -388,11 +448,23 @@ OVERPASS_MIRRORS = [
     "https://overpass.kumi.systems/api/interpreter",
 ]
 
-def _overpass(query, timeout=30, retries=2):
+import threading
+_OVERPASS_LOCK = threading.Lock()
+
+def _overpass(query, timeout=40, retries=2):
+    # The free Overpass servers limit concurrent requests per user, so when
+    # generate_report fetches data in parallel the Overpass calls still take
+    # turns (two simultaneous queries were getting rejected/timing out).
+    with _OVERPASS_LOCK:
+        return _overpass_unlocked(query, timeout, retries)
+
+def _overpass_unlocked(query, timeout=40, retries=2):
     """POST an Overpass query, trying every mirror, and retrying the whole
     mirror list up to `retries` times if all of them fail first time round —
     the free Overpass mirrors intermittently time out or rate-limit, and a
-    short retry clears most of those transient failures."""
+    short retry clears most of those transient failures. If every attempt
+    fails the result carries "_failed": True so the report can say the
+    service was unavailable rather than implying nothing exists nearby."""
     for attempt in range(retries):
         for url in OVERPASS_MIRRORS:
             try:
@@ -404,37 +476,40 @@ def _overpass(query, timeout=30, retries=2):
                 continue
         if attempt < retries - 1:
             time.sleep(3)
-    return {"elements": []}
+    return {"elements": [], "_failed": True}
 
-def fetch_rail_stations(lat, lng):
-    """Returns up to 4 nearest National Rail stations with distances.
-
+def _stations_from_elements(elements, lat, lng):
+    """Nearest 4 National Rail stations from Overpass elements.
     Only stations with a CRS code (the 3-letter National Rail code, e.g. CBG)
     are kept, which excludes heritage/tourist railways, Underground/metro,
     tram and miniature railway stops."""
+    nearest = {}
+    for el in elements:
+        tags = el.get("tags", {})
+        if tags.get("railway") != "station" or "ref:crs" not in tags:
+            continue
+        name = tags.get("name", "")
+        if not name or tags.get("usage") == "tourism" or tags.get("railway:preserved") == "yes":
+            continue
+        # Underground/metro stops can carry pseudo-CRS codes (e.g. ZOC) too
+        if tags.get("station") in ("subway", "light_rail", "monorail", "miniature", "funicular"):
+            continue
+        plat = el.get("lat", el.get("center", {}).get("lat"))
+        plon = el.get("lon", el.get("center", {}).get("lon"))
+        if plat is None or plon is None:
+            continue
+        dist = haversine_miles(lat, lng, plat, plon)
+        crs = tags["ref:crs"]
+        if crs not in nearest or dist < nearest[crs][1]:
+            nearest[crs] = (name, dist)
+    return sorted(nearest.values(), key=lambda x: x[1])[:4]
+
+def fetch_rail_stations(lat, lng):
+    """Returns up to 4 nearest National Rail stations with distances."""
     try:
         query = (f'[out:json][timeout:30];nwr[railway=station]["ref:crs"]'
                  f'(around:20000,{lat},{lng});out center tags;')
-        data = _overpass(query)
-        nearest = {}
-        for el in data.get("elements", []):
-            tags = el.get("tags", {})
-            name = tags.get("name", "")
-            if not name or tags.get("usage") == "tourism" or tags.get("railway:preserved") == "yes":
-                continue
-            # Underground/metro stops can carry pseudo-CRS codes (e.g. ZOC) too
-            if tags.get("station") in ("subway", "light_rail", "monorail", "miniature", "funicular"):
-                continue
-            plat = el.get("lat", el.get("center", {}).get("lat"))
-            plon = el.get("lon", el.get("center", {}).get("lon"))
-            if plat is None or plon is None:
-                continue
-            dist = haversine_miles(lat, lng, plat, plon)
-            crs = tags["ref:crs"]
-            if crs not in nearest or dist < nearest[crs][1]:
-                nearest[crs] = (name, dist)
-        stations = sorted(nearest.values(), key=lambda x: x[1])
-        return stations[:4]
+        return _stations_from_elements(_overpass(query).get("elements", []), lat, lng)
     except Exception:
         return []
 
@@ -582,10 +657,10 @@ def assess_clay_soil(geology, soil_texture=None):
         tex_lower = tex.lower()
         if "clay" in tex_lower:
             return ("YES", f"UKSO soil texture (1:50,000) at this location is recorded as "
-                            f"{tex} — {soil_texture.get('soil_group_desc', '')}".rstrip(" —"))
+                            f"{_sentence_case(tex).lower()} — {soil_texture.get('soil_group_desc', '')}".rstrip(" —"))
         else:
             return ("NO", f"UKSO soil texture (1:50,000) at this location is recorded as "
-                           f"{tex}, not clay-bearing.")
+                           f"{_sentence_case(tex).lower()}, not clay-bearing.")
 
     # Fallback: coarser 625k bedrock/superficial geology, if the UKSO lookup failed
     bedrock     = geology.get("bedrock") or {}
@@ -619,24 +694,29 @@ def assess_clay_soil(geology, soil_texture=None):
 SHOP_TYPES = {"supermarket", "convenience", "general", "department_store", "mall"}
 
 def fetch_schools_and_amenities(lat, lng):
-    """Single Overpass query for schools, shops, GPs, and pubs — avoids rate-limit issues."""
+    """Single Overpass query for schools, shops, GPs, and pubs — avoids rate-limit issues.
+
+    Shops are filtered to food/general shop types inside the query itself.
+    Previously every shop of any kind within 3 km was requested, which in a
+    city (e.g. central Cambridge) is thousands of results and made the query
+    time out on every mirror, leaving the amenities section blank.
+    Returns (schools, amenities, ok) — ok is False if the service failed."""
+    shop_re = "|".join(sorted(SHOP_TYPES))
     query = (
-        f"[out:json][timeout:30];"
+        f"[out:json][timeout:40];"
         f"("
-        f"node[amenity=school](around:3000,{lat},{lng});"
-        f"way[amenity=school](around:3000,{lat},{lng});"
-        f"node[shop](around:3000,{lat},{lng});"
-        f"way[shop](around:3000,{lat},{lng});"
-        f"node[amenity=doctors](around:6000,{lat},{lng});"
-        f"way[amenity=doctors](around:6000,{lat},{lng});"
-        f"node[amenity=pub](around:2000,{lat},{lng});"
-        f"way[amenity=pub](around:2000,{lat},{lng});"
+        f"nwr[amenity=school](around:3000,{lat},{lng});"
+        f'nwr[shop~"^({shop_re})$"](around:3000,{lat},{lng});'
+        f"nwr[amenity=doctors](around:6000,{lat},{lng});"
+        f"nwr[amenity=pub](around:2000,{lat},{lng});"
         f");out tags center;"
     )
     schools = []
     amenities = {"shops": [], "doctors": [], "pubs": []}
+    ok = True
     try:
         data = _overpass(query)
+        ok = not data.get("_failed")
         seen_schools = set()
         for el in data.get("elements", []):
             tags = el.get("tags", {})
@@ -662,52 +742,235 @@ def fetch_schools_and_amenities(lat, lng):
             elif amenity_tag == "pub":
                 amenities["pubs"].append({"name": name, "dist": dist})
     except Exception:
-        pass
+        ok = False
     schools.sort(key=lambda x: x["dist"] or 99)
-    for key in amenities:
+    for key in ("shops", "doctors", "pubs"):
         amenities[key].sort(key=lambda x: x["dist"] or 99)
-    return schools[:6], amenities
+    return schools[:6], amenities, ok
 
 # ── PDF BUILDER ────────────────────────────────────────────────────────────────
+# Design tokens for the polished layout (Nov 2026 redesign)
+NAVY      = DARK_BLUE
+ACCENT    = MID_BLUE
+LABEL_BG  = colors.HexColor("#F3F6FA")
+TILE_BG   = colors.HexColor("#F7F9FC")
+RULE      = colors.HexColor("#E1E6EE")
+MUTED     = colors.HexColor("#6B7280")
+INK       = colors.HexColor("#1F2937")
+OK_GREEN  = colors.HexColor("#2E7D32")
+NEUTRAL   = colors.HexColor("#9CA3AF")
 
-def _section_header(story, icon, title):
-    story.append(Paragraph(f"{icon}  {title}", SECH))
-    story.append(HRFlowable(width="100%", thickness=1.2, color=MID_BLUE, spaceAfter=2))
+LBL  = S("LBL2",  fontSize=8,   textColor=colors.HexColor("#4B5563"), fontName="Helvetica-Bold", leading=10)
+VAL  = S("VAL2",  fontSize=9,   textColor=INK, fontName="Helvetica", leading=11.5)
+NOTE = S("NOTE2", fontSize=7.3, textColor=MUTED, fontName="Helvetica-Oblique", leading=9.5)
+DISC = S("DISC2", fontSize=6.8, textColor=MUTED, fontName="Helvetica", leading=9)
 
-def _rows_table(rows, col_widths=(45*mm, 100*mm, 35*mm)):
-    RATING_COLORS = {"Very Good": GREEN, "Good": colors.HexColor("#2E7D32"),
-                     "Average": AMBER, "Poor": RED, "N/A": colors.HexColor("#888888")}
-    data = []
-    cmds = [
-        ("BACKGROUND",    (0,0),(-1,-1), LIGHT_GREY),
-        ("ROWBACKGROUNDS",(0,0),(-1,-1), [LIGHT_GREY, WHITE]),
-        ("LEFTPADDING",   (0,0),(-1,-1), 2.5*mm),
-        ("RIGHTPADDING",  (0,0),(-1,-1), 2*mm),
-        ("TOPPADDING",    (0,0),(-1,-1), 2*mm),
-        ("BOTTOMPADDING", (0,0),(-1,-1), 2*mm),
+def _pill(text, color, width=22*mm):
+    """Rounded coloured status badge."""
+    p = Paragraph(f"<b>{text}</b>", S("PILL", fontSize=7.2, textColor=WHITE,
+                                      fontName="Helvetica-Bold", alignment=1, leading=8.5))
+    t = Table([[p]], colWidths=[width], cornerRadii=[2.5, 2.5, 2.5, 2.5])
+    t.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0),(-1,-1), color),
+        ("TOPPADDING",    (0,0),(-1,-1), 2.2),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 2.8),
+        ("LEFTPADDING",   (0,0),(-1,-1), 2),
+        ("RIGHTPADDING",  (0,0),(-1,-1), 2),
+    ]))
+    return t
+
+def _heading(title, width=W):
+    """Section heading: accent bar, navy title, small-caps source on the right."""
+    main, _, src = title.partition("  (")
+    src = src.rstrip(")")
+    txt = f'<font name="Helvetica-Bold" size="11" color="#1B3A6B">{main.strip()}</font>'
+    src_p = Paragraph(src.upper(), S("HSRC", fontSize=6.5, textColor=MUTED,
+                                     fontName="Helvetica", alignment=2, leading=8)) if src else ""
+    src_w = 62*mm if (src and width > 120*mm) else 0
+    if src and not src_w:      # narrow (half-width) column: source under the title
+        txt += f'<br/><font size="6.5" color="#6B7280">{src.upper()}</font>'
+    cells = [["", Paragraph(txt, S("HT", leading=13)), src_p if src_w else ""]]
+    t = Table(cells, colWidths=[1.3*mm, width - 1.3*mm - src_w, src_w])
+    t.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0),(0,0), ACCENT),
+        ("LEFTPADDING",   (0,0),(0,0), 0), ("RIGHTPADDING", (0,0),(0,0), 0),
+        ("LEFTPADDING",   (1,0),(1,0), 2.5*mm),
+        ("RIGHTPADDING",  (2,0),(2,0), 0),
+        ("TOPPADDING",    (0,0),(-1,-1), 1),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 1.5),
         ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
-        ("BOX",           (0,0),(-1,-1), 0.3, colors.HexColor("#DDDDDD")),
-        ("LINEAFTER",     (0,0),(0,-1),  0.3, colors.HexColor("#CCCCCC")),
+    ]))
+    return [t, Spacer(1, 2*mm)]
+
+def _section_header(story, icon, title, width=W):
+    story.extend(_heading(title, width))
+
+def _rows_table(rows, col_widths=None, width=W):
+    """Label / value / optional status-badge table.
+
+    rows: (label, value, badge_text, badge_colour). The badge column is only
+    created when at least one row has a badge, so tables without badges use
+    the full width instead of showing an empty grey column."""
+    has_badge = any(r[2] for r in rows)
+    if col_widths:
+        cw = list(col_widths)
+        if len(cw) == 3 and not has_badge:
+            cw = [cw[0], cw[1] + cw[2]]
+    else:
+        cw = [44*mm, width - 44*mm - 27*mm, 27*mm] if has_badge else [44*mm, width - 44*mm]
+    data = []
+    for label, value, badge, badge_color in rows:
+        row = [Paragraph(label, LBL), Paragraph(value, VAL)]
+        if len(cw) == 3:
+            row.append(_pill(badge, badge_color or NEUTRAL, width=cw[2] - 4*mm) if badge else "")
+        data.append(row)
+    t = Table(data, colWidths=cw)
+    cmds = [
+        ("BACKGROUND",    (0,0),(0,-1), LABEL_BG),
+        ("LEFTPADDING",   (0,0),(-1,-1), 3*mm),
+        ("RIGHTPADDING",  (0,0),(-1,-1), 2.5*mm),
+        ("TOPPADDING",    (0,0),(-1,-1), 2.1*mm),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 2.1*mm),
+        ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
+        ("LINEABOVE",     (0,0),(-1,0),  0.6, RULE),
+        ("LINEBELOW",     (0,0),(-1,-1), 0.6, RULE),
     ]
-    for i, (label, value, badge, badge_color) in enumerate(rows):
-        badge_cell = Paragraph(
-            f"<b>{badge}</b>",
-            S(f"BG{i}", fontSize=8, textColor=WHITE, fontName="Helvetica-Bold", alignment=1)
-        ) if badge else ""
-        data.append([Paragraph(label, LBL), Paragraph(value, VAL), badge_cell])
-        bc = badge_color if badge else LIGHT_GREY
-        cmds.append(("BACKGROUND", (2,i),(2,i), bc))
-    t = Table(data, colWidths=list(col_widths))
+    if len(cw) == 3:
+        cmds += [("LEFTPADDING", (2,0),(2,-1), 2*mm), ("RIGHTPADDING", (2,0),(2,-1), 2*mm)]
     t.setStyle(TableStyle(cmds))
     return t
 
-def _section(story, icon, title, rows, note=None, col_widths=(45*mm, 100*mm, 35*mm)):
-    _section_header(story, icon, title)
-    story.append(_rows_table(rows, col_widths))
+def _section(story, icon, title, rows, note=None, col_widths=None):
+    # KeepTogether stops a section heading being stranded at the foot of a
+    # page with its table starting on the next one.
+    block = _heading(title)
+    block.append(_rows_table(rows, col_widths))
     if note:
-        story.append(Spacer(1, 1*mm))
-        story.append(Paragraph(note, NOTE))
+        block.append(Spacer(1, 1.2*mm))
+        block.append(Paragraph(note, NOTE))
+    story.append(KeepTogether(block))
+    story.append(Spacer(1, 5*mm))
+
+def _part(story, num, title):
+    """Numbered part divider (e.g. '02  FACILITIES & TRANSPORT'). Starts a new
+    page if there isn't room for the divider plus a reasonable first section,
+    so it never sits alone at the foot of a page."""
+    story.append(CondPageBreak(60*mm))
+    p = Paragraph(f'<font color="#2D6EAA">{num:02d}</font>&nbsp;&nbsp;&nbsp;{title.upper()}',
+                  S("PART", fontSize=9.5, textColor=NAVY, fontName="Helvetica-Bold", leading=12))
+    t = Table([[p]], colWidths=[W])
+    t.setStyle(TableStyle([
+        ("LEFTPADDING",   (0,0),(-1,-1), 0),
+        ("TOPPADDING",    (0,0),(-1,-1), 1*mm),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 1.6*mm),
+        ("LINEBELOW",     (0,0),(-1,-1), 1.4, NAVY),
+    ]))
+    story.append(t)
     story.append(Spacer(1, 3.5*mm))
+
+def _tile(label, value, color, sub="", width=43*mm):
+    """'At a glance' summary tile with a coloured top edge."""
+    content = [
+        Paragraph(label.upper(), S("TL", fontSize=6.5, textColor=MUTED, fontName="Helvetica-Bold", leading=8)),
+        Spacer(1, 1.2*mm),
+        Paragraph(value, S("TV", fontSize=10.5, textColor=INK, fontName="Helvetica-Bold", leading=12.5)),
+    ]
+    content.append(Paragraph(sub or "&nbsp;", S("TS", fontSize=7, textColor=MUTED, fontName="Helvetica", leading=9)))
+    t = Table([[content]], colWidths=[width], rowHeights=[19*mm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0),(-1,-1), TILE_BG),
+        ("LINEABOVE",     (0,0),(-1,0),  2.4, color),
+        ("LEFTPADDING",   (0,0),(-1,-1), 3*mm),
+        ("RIGHTPADDING",  (0,0),(-1,-1), 2*mm),
+        ("TOPPADDING",    (0,0),(-1,-1), 2.4*mm),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 2*mm),
+        ("VALIGN",        (0,0),(-1,-1), "TOP"),
+    ]))
+    return t
+
+def _tile_grid(tiles, per_row=4, gap=3*mm):
+    tw = (W - gap * (per_row - 1)) / per_row
+    cells, widths = [], []
+    rows = [tiles[i:i + per_row] for i in range(0, len(tiles), per_row)]
+    data = []
+    for r in rows:
+        line = []
+        for j, spec in enumerate(r):
+            if j:
+                line.append("")
+            line.append(_tile(*spec, width=tw))
+        data.append(line)
+    widths = []
+    for j in range(per_row):
+        if j:
+            widths.append(gap)
+        widths.append(tw)
+    t = Table(data, colWidths=widths)
+    t.setStyle(TableStyle([
+        ("LEFTPADDING",   (0,0),(-1,-1), 0), ("RIGHTPADDING", (0,0),(-1,-1), 0),
+        ("TOPPADDING",    (0,0),(-1,-1), 0), ("BOTTOMPADDING", (0,0),(-1,-1), gap),
+        ("VALIGN",        (0,0),(-1,-1), "TOP"),
+    ]))
+    return t
+
+def _data_table(header, rows, col_widths, align_right_cols=()):
+    """Header-row table used for EPC features and sales history."""
+    hs = S("DTH", fontSize=7.5, textColor=WHITE, fontName="Helvetica-Bold", leading=9)
+    data = [[Paragraph(h.upper(), hs) for h in header]] + rows
+    t = Table(data, colWidths=col_widths, repeatRows=1)
+    cmds = [
+        ("BACKGROUND",    (0,0),(-1,0), NAVY),
+        ("LEFTPADDING",   (0,0),(-1,-1), 3*mm),
+        ("RIGHTPADDING",  (0,0),(-1,-1), 2.5*mm),
+        ("TOPPADDING",    (0,0),(-1,-1), 1.9*mm),
+        ("BOTTOMPADDING", (0,0),(-1,-1), 1.9*mm),
+        ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
+        ("LINEBELOW",     (0,1),(-1,-1), 0.6, RULE),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1), [WHITE, TILE_BG]),
+    ]
+    for c in align_right_cols:
+        cmds.append(("ALIGN", (c,0),(c,-1), "RIGHT"))
+    t.setStyle(TableStyle(cmds))
+    return t
+
+def _sentence_case(text):
+    """BGS soil data comes back in capitals (e.g. 'CLAYEY LOAM TO SANDY LOAM')."""
+    t = (text or "").strip()
+    if not t or t == "N/A":
+        return t
+    t = re.sub(r"(?<=\w)\(", " (", t.lower())
+    return t[0].upper() + t[1:]
+
+def _footer_canvas(footer_text):
+    """Canvas class that stamps a footer with 'Page X of Y' on every page."""
+    from reportlab.pdfgen import canvas as _canvas
+
+    class _NumberedCanvas(_canvas.Canvas):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._saved_pages = []
+
+        def showPage(self):
+            self._saved_pages.append(dict(self.__dict__))
+            self._startPage()
+
+        def save(self):
+            total = len(self._saved_pages)
+            for state in self._saved_pages:
+                self.__dict__.update(state)
+                self.saveState()
+                self.setStrokeColor(RULE)
+                self.setLineWidth(0.6)
+                self.line(15*mm, 11.5*mm, 195*mm, 11.5*mm)
+                self.setFont("Helvetica", 6.8)
+                self.setFillColor(MUTED)
+                self.drawString(15*mm, 7.5*mm, footer_text)
+                self.drawRightString(195*mm, 7.5*mm, f"Page {self._pageNumber} of {total}")
+                self.restoreState()
+                super().showPage()
+            super().save()
+
+    return _NumberedCanvas
 
 # ── MAIN ENTRY POINT ───────────────────────────────────────────────────────────
 
@@ -783,411 +1046,410 @@ def generate_report(address, postcode, output_path):
         print(f"  ERROR: Could not resolve postcode {postcode}")
         return None
 
-    # Step 2 — parallel-ish data fetching
-    conservation_area = fetch_conservation_area(lat, lng)
-    listed_building   = fetch_listed_building(lat, lng, house_number)
-    coal_risk         = fetch_coal_mining_risk(lat, lng)
-    epc               = fetch_epc(postcode, house_number)
-    sales, rm_url     = fetch_sales_history(postcode, house_number)
-    stations          = fetch_rail_stations(lat, lng)
-    soil_data, soil_url = fetch_soil(lat, lng)
-    soil_texture       = fetch_uk_soil_texture(lat, lng)
-    geology            = fetch_bedrock_geology(lat, lng)
-    schools, amenities = fetch_schools_and_amenities(lat, lng)
+    # Step 2 — fetch everything in parallel (each source is independent, and
+    # running them side by side cuts generation time from minutes to roughly
+    # the time of the slowest single lookup)
+    from concurrent.futures import ThreadPoolExecutor
 
+    def _get_sales():
+        rm = f"https://www.rightmove.co.uk/house-prices/{postcode.replace(' ', '-').lower()}.html"
+        lr = fetch_land_registry_sales(postcode, address)
+        if lr:
+            return lr, "HM Land Registry Price Paid Data", rm
+        rm_sales, rm = fetch_sales_history(postcode, house_number)
+        return rm_sales, ("Rightmove" if rm_sales else "HM Land Registry Price Paid Data"), rm
+
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        f_ca     = ex.submit(fetch_conservation_area, lat, lng)
+        f_lb     = ex.submit(fetch_listed_building, lat, lng, house_number)
+        f_coal   = ex.submit(fetch_coal_mining_risk, lat, lng)
+        f_epc    = ex.submit(fetch_epc, postcode, house_number)
+        f_sales  = ex.submit(_get_sales)
+        f_rail   = ex.submit(fetch_rail_stations, lat, lng)
+        f_soil   = ex.submit(fetch_soil, lat, lng)
+        f_tex    = ex.submit(fetch_uk_soil_texture, lat, lng)
+        f_geo    = ex.submit(fetch_bedrock_geology, lat, lng)
+        f_fac    = ex.submit(fetch_schools_and_amenities, lat, lng)
+        f_radon  = ex.submit(fetch_radon_status, lat, lng)
+        conservation_area = f_ca.result()
+        listed_building   = f_lb.result()
+        coal_risk         = f_coal.result()
+        epc               = f_epc.result()
+        sales, sales_source, rm_url = f_sales.result()
+        stations          = f_rail.result()
+        soil_data, soil_url = f_soil.result()
+        soil_texture      = f_tex.result()
+        geology           = f_geo.result()
+        schools, amenities, amenities_ok = f_fac.result()
+        radon_desc, (radon_hex, radon_badge) = f_radon.result()
+
+    clay_verdict, clay_reason = assess_clay_soil(geology, soil_texture)
     print(f"  Data fetched. Building PDF...")
 
     # ── Build PDF ──────────────────────────────────────────────────────────────
     doc = SimpleDocTemplate(
         output_path, pagesize=A4,
         leftMargin=15*mm, rightMargin=15*mm,
-        topMargin=15*mm, bottomMargin=15*mm,
+        topMargin=13*mm, bottomMargin=18*mm,
+        title=f"Property Environmental Report — {address}, {postcode}",
+        author="CWH Surveyors LLP",
     )
     story = []
     try:
         today = datetime.now().strftime("%#d %B %Y")  # Windows strips leading zero
     except Exception:
         today = datetime.now().strftime("%d %B %Y")
+    pc_enc = postcode.replace(" ", "+")
 
-    # Header — logo on right, address on left
-    import os as _os
-    logo_cell = ""
-    if _os.path.exists(LOGO_PATH):
+    # ── Masthead: logo on white, then navy address band ──────────────────────
+    logo_cell = Paragraph("<b>CWH Surveyors LLP</b>", S("LGO", fontSize=12, textColor=NAVY))
+    if os.path.exists(LOGO_PATH):
         try:
-            logo_img = Image(LOGO_PATH, height=14*mm, width=45*mm)
-            logo_img.hAlign = "RIGHT"
-            logo_cell = logo_img
+            logo_cell = Image(LOGO_PATH, height=12.5*mm, width=12.5*mm * 2484 / 451)
+            logo_cell.hAlign = "LEFT"
         except Exception:
-            logo_cell = Paragraph("CWH Surveyors LLP", S("LGO", fontSize=9, textColor=WHITE, fontName="Helvetica-Bold", alignment=2))
-
-    hdr_table = Table([[
-        Paragraph(f"{address},  {postcode}", HDR),
+            pass
+    masthead = Table([[
         logo_cell,
-    ],[
-        Paragraph(la_name, SUB),
-        Paragraph("Property Environmental Report", S("DR", fontSize=8, textColor=colors.HexColor("#BDD7EE"), fontName="Helvetica", alignment=2)),
-    ]], colWidths=[130*mm, 50*mm])
-    hdr_table.setStyle(TableStyle([
-        ("BACKGROUND",   (0,0),(-1,-1), DARK_BLUE),
-        ("LEFTPADDING",  (0,0),(-1,-1), 5*mm),
-        ("RIGHTPADDING", (0,0),(-1,-1), 4*mm),
-        ("TOPPADDING",   (0,0),(-1,-1), 3*mm),
-        ("BOTTOMPADDING",(0,0),(-1,-1), 3*mm),
-        ("VALIGN",       (0,0),(-1,-1), "MIDDLE"),
-        ("ALIGN",        (1,0),(1,-1),  "RIGHT"),
+        Paragraph(f'<font name="Helvetica-Bold" size="8" color="#1B3A6B">PROPERTY ENVIRONMENTAL REPORT</font>'
+                  f'<br/><font size="7.5" color="#6B7280">Prepared {today}</font>',
+                  S("MR", alignment=2, leading=11)),
+    ]], colWidths=[100*mm, 80*mm])
+    masthead.setStyle(TableStyle([
+        ("VALIGN",        (0,0),(-1,-1), "BOTTOM"),
+        ("LEFTPADDING",   (0,0),(-1,-1), 0), ("RIGHTPADDING", (0,0),(-1,-1), 0),
+        ("TOPPADDING",    (0,0),(-1,-1), 0), ("BOTTOMPADDING", (0,0),(-1,-1), 2.5*mm),
     ]))
-    story.append(hdr_table)
+    story.append(masthead)
+    story.append(Spacer(1, 2*mm))
+
+    band = Table([
+        [Paragraph(address, S("ADDR", fontSize=17, textColor=WHITE, fontName="Helvetica-Bold", leading=21))],
+        [Paragraph(f"{postcode}&nbsp;&nbsp;·&nbsp;&nbsp;{la_name}&nbsp;&nbsp;·&nbsp;&nbsp;{region or 'England'}",
+                   S("ADDR2", fontSize=9.5, textColor=colors.HexColor("#C9DBF0"), fontName="Helvetica", leading=12))],
+    ], colWidths=[W], cornerRadii=[3, 3, 3, 3])
+    band.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0),(-1,-1), NAVY),
+        ("LEFTPADDING",   (0,0),(-1,-1), 6*mm), ("RIGHTPADDING", (0,0),(-1,-1), 6*mm),
+        ("TOPPADDING",    (0,0),(0,0),   5*mm), ("BOTTOMPADDING", (0,0),(0,0), 1.5*mm),
+        ("TOPPADDING",    (0,1),(0,1),   0),    ("BOTTOMPADDING", (0,1),(0,1), 5*mm),
+    ]))
+    story.append(band)
     story.append(Spacer(1, 3*mm))
 
     # Property strip
     floor_area = epc.get("floor_area", "N/A") if epc else "N/A"
     prop_type  = epc.get("prop_type",  "N/A") if epc else "N/A"
-    strip_items = [
-        f"<b>Postcode</b><br/>{postcode}",
-        f"<b>Local Authority</b><br/>{la_name}",
-        f"<b>Region</b><br/>{region or 'England'}",
-        f"<b>Property Type</b><br/>{prop_type}",
-        f"<b>Floor Area</b><br/>{floor_area}",
-    ]
-    strip = Table([[Paragraph(t, S(f"SI{j}", fontSize=8.5, textColor=DARK_BLUE, fontName="Helvetica", leading=13))
-                   for j, t in enumerate(strip_items)]], colWidths=[W/5]*5)
+    tenure     = sales[0]["tenure"] if sales and sales[0].get("tenure") else "Not recorded"
+    strip_items = [("Property Type", prop_type), ("Floor Area", floor_area), ("Tenure", tenure),
+                   ("Local Authority", la_name), ("Region", region or "England")]
+    strip = Table([[
+        [Paragraph(k.upper(), S(f"SK{j}", fontSize=6.5, textColor=MUTED, fontName="Helvetica-Bold", leading=8)),
+         Spacer(1, 0.8*mm),
+         Paragraph(v, S(f"SV{j}", fontSize=9, textColor=NAVY, fontName="Helvetica-Bold", leading=11))]
+        for j, (k, v) in enumerate(strip_items)
+    ]], colWidths=[W/5]*5)
     strip.setStyle(TableStyle([
-        ("BACKGROUND",   (0,0),(-1,-1), LIGHT_BLUE),
-        ("LEFTPADDING",  (0,0),(-1,-1), 3*mm),
-        ("TOPPADDING",   (0,0),(-1,-1), 2.5*mm),
-        ("BOTTOMPADDING",(0,0),(-1,-1), 2.5*mm),
-        ("LINEAFTER",    (0,0),(3,0), 0.4, colors.HexColor("#BBCCDD")),
-        ("BOX",          (0,0),(-1,-1), 0.4, colors.HexColor("#BBCCDD")),
+        ("LEFTPADDING",   (0,0),(-1,-1), 3*mm),
+        ("TOPPADDING",    (0,0),(-1,-1), 2.2*mm), ("BOTTOMPADDING", (0,0),(-1,-1), 2.4*mm),
+        ("VALIGN",        (0,0),(-1,-1), "TOP"),
+        ("LINEAFTER",     (0,0),(3,0),   0.6, RULE),
+        ("LINEBELOW",     (0,0),(-1,0),  0.6, RULE),
     ]))
     story.append(strip)
+    story.append(Spacer(1, 5*mm))
+
+    # ── At a glance ───────────────────────────────────────────────────────────
+    RATING_COLOURS = {"A": OK_GREEN, "B": OK_GREEN, "C": colors.HexColor("#689F38"),
+                      "D": AMBER, "E": colors.HexColor("#E65100"), "F": RED, "G": RED}
+    if epc:
+        epc_rating = epc.get("rating", "N/A")
+        t_epc = ("Energy Rating", f"{epc_rating}  <font size='8' color='#6B7280'>({epc.get('score','—')})</font>",
+                 RATING_COLOURS.get(epc_rating, NEUTRAL),
+                 f"Potential {epc.get('pot_rating','—')} ({epc.get('pot_score','—')})")
+    else:
+        t_epc = ("Energy Rating", "Not found", NEUTRAL, "No EPC on register")
+    if conservation_area:
+        t_ca = ("Conservation Area", "Within", PURPLE, _sentence_case(conservation_area)[:34])
+    else:
+        t_ca = ("Conservation Area", "None recorded", OK_GREEN, "Indicative — confirm with LPA")
+    if listed_building:
+        g = listed_building.get("grade", "")
+        t_lb = ("Listed Building", f"Grade {g}", RED if g in ("I", "II*") else AMBER, "Historic England")
+    else:
+        t_lb = ("Listed Building", "Not listed", OK_GREEN, "Historic England")
+    t_coal = {"high": ("Coal Mining", "High risk", RED, "CON29M recommended"),
+              "low":  ("Coal Mining", "Low risk", AMBER, "Development low risk area")}.get(
+              coal_risk, ("Coal Mining", "Not in risk area", OK_GREEN, "Mining Remediation Authority"))
+    t_clay = {"YES": ("Clay Soils", "Clay indicated", RED, "See ground conditions"),
+              "NO":  ("Clay Soils", "Not indicated", OK_GREEN, "See ground conditions")}.get(
+              clay_verdict, ("Clay Soils", "Unknown", NEUTRAL, "No data at this location"))
+    if sales:
+        t_sale = ("Last Sale", sales[0]["price"], NAVY, sales[0]["date"])
+    else:
+        t_sale = ("Last Sale", "No record", NEUTRAL, "HM Land Registry")
+    tiles = [
+        t_epc,
+        ("Flood Risk", "Check required", AMBER, "EA long-term flood service"),
+        ("Radon", radon_badge.title(), colors.HexColor(radon_hex), "UKHSA indicative"),
+        t_clay,
+        t_ca, t_lb, t_coal, t_sale,
+    ]
+    story.extend(_heading("At a Glance"))
+    story.append(_tile_grid(tiles))
     story.append(Spacer(1, 4*mm))
 
-    # Flood Risk
-    pc_enc = postcode.replace(" ", "+")
-    _section(story, "🌊", "Flood Risk  (Environment Agency)", [
-        ("Rivers & Sea",  "Check required — see link below", "CHECK", AMBER),
-        ("Surface Water", "Check required — see link below", "CHECK", AMBER),
-        ("Direct Link",   link(f"https://check-long-term-flood-risk.service.gov.uk/postcode?postcode={pc_enc}",
-                               "check-long-term-flood-risk.service.gov.uk"), "", None),
-    ], note="EA flood risk service requires CAPTCHA verification — follow the link above.",
-    col_widths=(40*mm, 98*mm, 20*mm))
+    # ══ 1. ENERGY PERFORMANCE ══════════════════════════════════════════════════
+    _part(story, 1, "Energy Performance")
+    if epc:
+        co2         = epc.get("co2", "N/A")
+        primary_use = epc.get("primary_use", "N/A")
+        primary_use = re.sub(r"^The primary energy use for this property per year is\s*", "", primary_use)
+        epc_rows = [
+            ("Current Rating",     f"<b>{epc_rating}</b> (score {epc.get('score','N/A')})  —  potential "
+                                   f"{epc.get('pot_rating','N/A')} ({epc.get('pot_score','N/A')})",
+             f"{epc_rating} RATED", RATING_COLOURS.get(epc_rating, AMBER)),
+            ("Annual Energy Cost", epc.get("annual_cost", "N/A"), "", None),
+            ("CO2 Emissions",      co2, "", None),
+            ("Primary Energy Use", primary_use, "", None),
+            ("Certificate Date",   f"{epc.get('cert_date','N/A')}  ·  valid until {epc.get('valid_until','N/A')}", "", None),
+            ("Certificate No.",    link(f"https://find-energy-certificate.service.gov.uk/energy-certificate/{epc['cert_id']}",
+                                        epc["cert_id"]), "", None),
+        ]
+        epc_note = None
+        if re.search(r"(^|\s)-\d", f"{co2} {primary_use}"):
+            epc_note = ("Negative CO2 / primary energy figures are as recorded on the certificate. They usually arise "
+                        "where the property is credited for low-carbon community heating or on-site renewable "
+                        "generation.")
+        _section(story, "", "Energy Performance Certificate  (Gov.uk EPC Register)", epc_rows, note=epc_note)
 
-    # Radon
-    radon_desc, (radon_hex, radon_badge) = fetch_radon_status(lat, lng)
-    radon_color = colors.HexColor(radon_hex)
-    _section(story, "☢", "Radon  (UKHSA)", [
-        ("Indicative Status", radon_desc, radon_badge, radon_color),
-        ("UKHSA Action Level","200 Bq/m³ for homes", "", None),
-        ("Interactive Map",   link("www.ukradon.org/information/ukmaps"), "", None),
-    ], note="For a definitive address-level result use the UKHSA paid address search at ukradon.org (£3.90).",
-    col_widths=(40*mm, 98*mm, 20*mm))
+        features = epc.get("features", [])
+        if features:
+            RATING_COL = {"Very good": OK_GREEN, "Good": OK_GREEN, "Average": AMBER,
+                          "Poor": RED, "Very poor": RED, "N/A": NEUTRAL}
+            frows = [[Paragraph(f["feature"], LBL), Paragraph(f["desc"], VAL),
+                      _pill(f["rating"], RATING_COL.get(f["rating"], AMBER), width=22*mm)]
+                     for f in features]
+            feat_block = _heading("Building Features  (as assessed for the EPC)")
+            feat_block.append(_data_table(["Feature", "Description", "Rating"], frows,
+                                          [40*mm, 113*mm, 27*mm]))
+            # Allowed to split across pages (header row repeats) rather than
+            # being pushed whole onto the next page and leaving a gap.
+            story.append(CondPageBreak(40*mm))   # heading + header row + a few rows
+            story.extend(feat_block)
+            story.append(Spacer(1, 5*mm))
+    else:
+        _section(story, "", "Energy Performance Certificate  (Gov.uk EPC Register)", [
+            ("Status", f"No EPC found for {house_number} at postcode {postcode}", "", None),
+            ("Search", link(f"https://find-energy-certificate.service.gov.uk/find-a-certificate/search-by-postcode?postcode={pc_enc}",
+                            "Search the EPC register"), "", None),
+        ])
 
-    # Conservation Area
+    # ══ 2. FACILITIES & TRANSPORT ══════════════════════════════════════════════
+    _part(story, 2, "Facilities & Transport")
+    COL = 88*mm
+    schools_block = _heading("Local Schools  (Ofsted)", width=COL)
+    ofsted_search = link(f"https://reports.ofsted.gov.uk/search?q={postcode}&tab=schools", "reports.ofsted.gov.uk")
+    if schools:
+        sch_rows = [(link(s["url"], s["name"][:70]),
+                     f"{s['dist']:.1f} mi" if s.get("dist") is not None else "", "", None)
+                    for s in schools[:5]]
+        schools_block.append(_rows_table(sch_rows, (70*mm, 18*mm)))
+        schools_block.append(Spacer(1, 1.2*mm))
+        schools_block.append(Paragraph("Select a school name to view its Ofsted reports.", NOTE))
+    elif not amenities_ok:
+        schools_block.append(Paragraph(f"School data temporarily unavailable — search {ofsted_search}.", NOTE))
+    else:
+        schools_block.append(Paragraph(f"No schools found within 2 miles — search {ofsted_search}.", NOTE))
+
+    amenities_block = _heading("Local Amenities  (OpenStreetMap)", width=COL)
+    amenity_rows = []
+    for key, tag, colr in (("shops", "SHOP", ACCENT), ("doctors", "GP", OK_GREEN), ("pubs", "PUB", AMBER)):
+        for a in amenities[key][:2]:
+            d = f"{a['dist']:.1f} mi" if a.get("dist") is not None else ""
+            amenity_rows.append((a["name"][:60], d, tag, colr))
+    if amenity_rows:
+        amenities_block.append(_rows_table(amenity_rows, (52*mm, 18*mm, 18*mm)))
+        amenities_block.append(Spacer(1, 1.2*mm))
+        amenities_block.append(Paragraph("Verify current trading status locally.", NOTE))
+    elif not amenities_ok:
+        amenities_block.append(Paragraph("Amenity data temporarily unavailable (OpenStreetMap did not respond) — "
+                                         "re-run the report or check locally.", NOTE))
+    else:
+        amenities_block.append(Paragraph("No shops, GP surgeries or pubs recorded nearby.", NOTE))
+
+    two_col = Table([[schools_block, "", amenities_block]], colWidths=[COL, W - 2*COL, COL])
+    two_col.setStyle(TableStyle([
+        ("VALIGN",(0,0),(-1,-1),"TOP"),
+        ("LEFTPADDING",(0,0),(-1,-1),0), ("RIGHTPADDING",(0,0),(-1,-1),0),
+        ("TOPPADDING",(0,0),(-1,-1),0),  ("BOTTOMPADDING",(0,0),(-1,-1),0),
+    ]))
+    story.append(two_col)
+    story.append(Spacer(1, 5*mm))
+
+    if stations:
+        rail_rows = [(name, f"{dist:.1f} miles", "NEAREST" if i == 0 else "", TEAL if i == 0 else None)
+                     for i, (name, dist) in enumerate(stations)]
+        rail_rows.append(("Journey Planner", link("www.nationalrail.co.uk"), "", None))
+    else:
+        rail_rows = [("Status", "Station data temporarily unavailable — check nationalrail.co.uk", "", None),
+                     ("Journey Planner", link("www.nationalrail.co.uk"), "", None)]
+    _section(story, "", "Nearest Railway Stations  (National Rail)", rail_rows,
+             note="Straight-line distances. Driving distances will be greater.")
+
+    # ══ 3. PLANNING & DESIGNATIONS ═════════════════════════════════════════════
+    _part(story, 3, "Planning & Designations")
     if conservation_area:
-        ca_status = f"WITHIN designated conservation area"
         ca_rows = [
-            ("Status",            ca_status, "DESIGNATED", PURPLE),
+            ("Status",            "Within a designated conservation area", "DESIGNATED", PURPLE),
             ("Conservation Area", conservation_area, "", None),
             ("Planning Data Map", link("www.planning.data.gov.uk/map/?dataset=conservation-area"), "", None),
         ]
         ca_note = "Conservation area designation restricts permitted development rights. Confirm boundary with the LPA."
     else:
         ca_rows = [
-            ("Status",            "No conservation area recorded at this location (indicative)", "", None),
+            ("Status",            "No conservation area recorded at this location (indicative)", "NONE", OK_GREEN),
             ("Planning Data Map", link("www.planning.data.gov.uk/map/?dataset=conservation-area"), "", None),
         ]
         ca_note = "National dataset is not exhaustive — confirm with the LPA for definitive status."
-    _section(story, "🏛", "Conservation Area  (Historic England / Planning Data)",
-             ca_rows, note=ca_note, col_widths=(40*mm, 98*mm, 20*mm))
+    _section(story, "", "Conservation Area  (Historic England / Planning Data)", ca_rows, note=ca_note)
 
-    # Listed Building
     if listed_building:
         grade = listed_building.get("grade", "")
         grade_color = {"I": RED, "II*": RED, "II": AMBER}.get(grade, PURPLE)
         lb_rows = [
-            ("Status",  f"LISTED BUILDING — Grade {grade}", f"GRADE {grade}", grade_color),
+            ("Status",  f"Listed building — Grade {grade}", f"GRADE {grade}", grade_color),
             ("Name",    listed_building.get("name", ""), "", None),
         ]
         if listed_building.get("url"):
             lb_rows.append(("Historic England", link(listed_building["url"], "View listing"), "", None))
         lb_note = "Listed building status imposes restrictions on alterations. Consent required from LPA for most works."
     else:
-        lb_rows = [("Status", "No listed building recorded at this location (indicative)", "", None),
+        lb_rows = [("Status", "No listed building recorded at this location (indicative)", "NOT LISTED", OK_GREEN),
                    ("Source", link("https://historicengland.org.uk/listing/the-list/", "Historic England — The List"), "", None)]
         lb_note = "Confirm with Historic England if listing status is critical to the survey."
-    _section(story, "🏰", "Listed Building Status  (Historic England)", lb_rows,
-             note=lb_note, col_widths=(40*mm, 98*mm, 20*mm))
+    _section(story, "", "Listed Building Status  (Historic England)", lb_rows, note=lb_note)
 
-    # Coal Mining Risk
-    coal_gov_link = link(
-        "https://www.gov.uk/government/publications/coal-mining-data-development-high-risk-areas",
-        "gov.uk — coal mining data"
-    )
+    _section(story, "", "Planning History  (Local Planning Authority)", [
+        ("Planning Authority", la_name, "", None),
+        ("Planning Portal",    link("www.gov.uk/search-register-planning-decisions"), "", None),
+    ])
+
+    # ══ 4. ENVIRONMENT & GROUND CONDITIONS ═════════════════════════════════════
+    _part(story, 4, "Environment & Ground Conditions")
+    _section(story, "", "Flood Risk  (Environment Agency)", [
+        ("Rivers & Sea",  "Check required — see link below", "CHECK", AMBER),
+        ("Surface Water", "Check required — see link below", "CHECK", AMBER),
+        ("Direct Link",   link(f"https://check-long-term-flood-risk.service.gov.uk/postcode?postcode={pc_enc}",
+                               "check-long-term-flood-risk.service.gov.uk"), "", None),
+    ], note="The EA flood risk service requires CAPTCHA verification — follow the link above.")
+
+    _section(story, "", "Radon  (UKHSA)", [
+        ("Indicative Status",  radon_desc, radon_badge, colors.HexColor(radon_hex)),
+        ("UKHSA Action Level", "200 Bq/m³ for homes", "", None),
+        ("Interactive Map",    link("www.ukradon.org/information/ukmaps"), "", None),
+    ], note="For a definitive address-level result use the UKHSA paid address search at ukradon.org (£3.90).")
+
+    coal_gov_link = link("https://www.gov.uk/government/publications/coal-mining-data-development-high-risk-areas",
+                         "gov.uk — coal mining data")
     if coal_risk == "high":
-        cm_rows = [
-            ("Status", "WITHIN a Coal Mining Development High Risk Area", "HIGH RISK", RED),
-            ("Source", coal_gov_link, "", None),
-        ]
+        cm_rows = [("Status", "Within a Coal Mining Development High Risk Area", "HIGH RISK", RED),
+                   ("Source", coal_gov_link, "", None)]
         cm_note = ("A Coal Mining Report (CON29M) is recommended prior to purchase — instruct via a "
                    "solicitor or directly with the Mining Remediation Authority (coal.gov.uk).")
     elif coal_risk == "low":
-        cm_rows = [
-            ("Status", "WITHIN a Coal Mining Development Low Risk Area", "LOW RISK", AMBER),
-            ("Source", coal_gov_link, "", None),
-        ]
+        cm_rows = [("Status", "Within a Coal Mining Development Low Risk Area", "LOW RISK", AMBER),
+                   ("Source", coal_gov_link, "", None)]
         cm_note = "Low risk area — a Coal Mining Report is not routinely required but may still be advisable."
     else:
-        cm_rows = [
-            ("Status", "Not within a recorded coal mining development risk area (indicative)", "", None),
-            ("Source", coal_gov_link, "", None),
-        ]
+        cm_rows = [("Status", "Not within a recorded coal mining development risk area (indicative)", "NOT IN AREA", OK_GREEN),
+                   ("Source", coal_gov_link, "", None)]
         cm_note = ("Based on Mining Remediation Authority (formerly the Coal Authority) risk area data — "
                    "confirm via a CON29M search if in doubt.")
-    _section(story, "⛏", "Coal Mining Risk  (Mining Remediation Authority)", cm_rows,
-             note=cm_note, col_widths=(40*mm, 98*mm, 20*mm))
+    _section(story, "", "Coal Mining Risk  (Mining Remediation Authority)", cm_rows, note=cm_note)
 
-    # Planning History
-    _section(story, "📋", "Planning History", [
-        ("Local Planning Authority", la_name, "", None),
-        ("Planning Portal",          link("www.gov.uk/search-register-planning-decisions"), "", None),
-    ], col_widths=(40*mm, 118*mm, 0*mm))
-
-    # EPC
-    if epc:
-        epc_rating = epc.get("rating", "N/A")
-        rating_badge_color = {"A": GREEN, "B": GREEN, "C": colors.HexColor("#5D8A27"),
-                              "D": AMBER,  "E": RED,   "F": RED, "G": RED}.get(epc_rating, AMBER)
-        epc_rows = [
-            ("Property",           f"{address}, {postcode}  |  {epc.get('prop_type','N/A')}  |  {epc.get('floor_area','N/A')}", "", None),
-            ("Current EPC Rating", f"{epc_rating}  (Score: {epc.get('score','N/A')})  —  Potential: {epc.get('pot_rating','N/A')} ({epc.get('pot_score','N/A')})",
-             f"{epc_rating} RATED", rating_badge_color),
-            ("Annual Energy Cost", epc.get("annual_cost", "N/A"), "", None),
-            ("CO2 Emissions",      epc.get("co2", "N/A"), "", None),
-            ("Primary Energy Use", epc.get("primary_use", "N/A"), "", None),
-            ("Certificate Date",   f"{epc.get('cert_date','N/A')}  |  Valid until: {epc.get('valid_until','N/A')}", "", None),
-            ("Certificate No.",    link(f"https://find-energy-certificate.service.gov.uk/energy-certificate/{epc['cert_id']}",
-                                        epc["cert_id"]), "", None),
-        ]
-        _section(story, "⚡", "Energy Performance Certificate  (Gov.uk / MHCLG)",
-                 epc_rows, col_widths=(40*mm, 105*mm, 23*mm))
-
-        # EPC building features table
-        features = epc.get("features", [])
-        if features:
-            RATING_COL = {"Very good": GREEN, "Good": GREEN, "Average": AMBER,
-                          "Poor": RED, "Very poor": RED, "N/A": colors.HexColor("#888888")}
-            feat_hdr = S("FH", fontSize=8, textColor=WHITE, fontName="Helvetica-Bold")
-            feat_data = [[Paragraph(h, feat_hdr) for h in ["Feature", "Description", "Rating"]]]
-            feat_cmds = [
-                ("BACKGROUND",   (0,0),(-1,0), DARK_BLUE),
-                ("ROWBACKGROUNDS",(0,1),(-1,-1), [LIGHT_GREY, WHITE]),
-                ("LEFTPADDING",  (0,0),(-1,-1), 2.5*mm),
-                ("RIGHTPADDING", (0,0),(-1,-1), 2*mm),
-                ("TOPPADDING",   (0,0),(-1,-1), 2*mm),
-                ("BOTTOMPADDING",(0,0),(-1,-1), 2*mm),
-                ("VALIGN",       (0,0),(-1,-1), "MIDDLE"),
-                ("BOX",          (0,0),(-1,-1), 0.3, colors.HexColor("#CCCCCC")),
-                ("INNERGRID",    (0,0),(-1,-1), 0.3, colors.HexColor("#DDDDDD")),
-            ]
-            for i, f in enumerate(features, start=1):
-                rc = RATING_COL.get(f["rating"], AMBER)
-                rating_p = Paragraph(f"<b>{f['rating']}</b>",
-                                     S(f"FR{i}", fontSize=8, textColor=WHITE, fontName="Helvetica-Bold", alignment=1))
-                feat_data.append([
-                    Paragraph(f["feature"], LBL),
-                    Paragraph(f["desc"],    VAL),
-                    rating_p,
-                ])
-                feat_cmds.append(("BACKGROUND", (2,i),(2,i), rc))
-            feat_table = Table(feat_data, colWidths=[38*mm, 112*mm, 30*mm])
-            feat_table.setStyle(TableStyle(feat_cmds))
-            story.append(feat_table)
-            story.append(Spacer(1, 3.5*mm))
-    else:
-        _section(story, "⚡", "Energy Performance Certificate", [
-            ("Status", f"No EPC found for {house_number} at postcode {postcode}", "", None),
-            ("Search", link(f"https://find-energy-certificate.service.gov.uk/find-a-certificate/search-by-postcode?postcode={pc_enc}",
-                            "Search EPC register"), "", None),
-        ], col_widths=(40*mm, 118*mm, 0*mm))
-
-    # Sales History
-    rm_link_text = postcode.replace(" ", "-").lower()
-    _section_header(story, "🏡", "Sales History  (Rightmove / Land Registry)")
-    sh_hdr = S("SHH", fontSize=8, textColor=WHITE, fontName="Helvetica-Bold")
-    if sales:
-        sh_data = [[Paragraph(h, sh_hdr) for h in ["<b>Address</b>","<b>Sale Price</b>","<b>Date Sold</b>","<b>Type</b>","<b>Tenure</b>"]]]
-        for s in sales:
-            sh_data.append([
-                Paragraph(f"<b>{s['address']}</b>", S("SA", fontSize=9, fontName="Helvetica-Bold", textColor=TEXT)),
-                Paragraph(f"<b>{s['price']}</b>",   S("SP", fontSize=9, fontName="Helvetica-Bold", textColor=TEXT, alignment=2)),
-                Paragraph(s["date"],   S("SD", fontSize=9, fontName="Helvetica", textColor=TEXT)),
-                Paragraph(s["type"],   S("ST", fontSize=9, fontName="Helvetica", textColor=TEXT)),
-                Paragraph(s["tenure"], S("SN", fontSize=9, fontName="Helvetica", textColor=TEXT)),
-            ])
-        sh_table = Table(sh_data, colWidths=[70*mm, 28*mm, 28*mm, 28*mm, 26*mm])
-        sh_table.setStyle(TableStyle([
-            ("BACKGROUND",   (0,0),(-1,0), DARK_BLUE),
-            ("BACKGROUND",   (0,1),(-1,-1), colors.HexColor("#FFF8E1")),
-            ("LEFTPADDING",  (0,0),(-1,-1), 2.5*mm),
-            ("RIGHTPADDING", (0,0),(-1,-1), 2*mm),
-            ("TOPPADDING",   (0,0),(-1,-1), 2.5*mm),
-            ("BOTTOMPADDING",(0,0),(-1,-1), 2.5*mm),
-            ("VALIGN",       (0,0),(-1,-1), "MIDDLE"),
-            ("BOX",          (0,0),(-1,-1), 0.3, colors.HexColor("#CCCCCC")),
-            ("INNERGRID",    (0,0),(-1,-1), 0.3, colors.HexColor("#DDDDDD")),
-            ("ALIGN",        (1,0),(1,-1),  "RIGHT"),
-            ("LINEABOVE",    (0,1),(-1,1),  1.0, colors.HexColor("#D4A017")),
-            ("LINEBELOW",    (0,-1),(-1,-1), 1.0, colors.HexColor("#D4A017")),
-        ]))
-        story.append(sh_table)
-    else:
-        story.append(Paragraph(f"No sold price records found — check Rightmove directly.", VAL))
-    story.append(Spacer(1, 1.5*mm))
-    story.append(Paragraph(f'Full history: {link(rm_url, f"rightmove.co.uk/house-prices/{rm_link_text}.html")}  |  Source: Rightmove / HM Land Registry.', NOTE))
-    story.append(Spacer(1, 3.5*mm))
-
-    # Schools + Amenities side by side
-    schools_block = [
-        Paragraph("🎓  Local Schools  (Ofsted)", SECH),
-        HRFlowable(width="100%", thickness=1.2, color=MID_BLUE, spaceAfter=2),
-    ]
-    if schools:
-        sch_rows = []
-        for sch in schools[:5]:
-            dist_text = f"{sch['dist']:.1f} mi" if sch.get("dist") is not None else ""
-            sch_rows.append((
-                link(sch["url"], sch["name"][:32]),
-                dist_text,
-                "",
-                None,
-            ))
-        schools_block.append(_rows_table(sch_rows, (62*mm, 15*mm, 13*mm)))
-    else:
-        schools_block.append(Paragraph(f'Search: {link(f"https://reports.ofsted.gov.uk/search?q={postcode}&tab=schools", "reports.ofsted.gov.uk")}', NOTE))
-
-    amenities_block = [
-        Paragraph("🛒  Local Amenities  (OpenStreetMap)", SECH),
-        HRFlowable(width="100%", thickness=1.2, color=MID_BLUE, spaceAfter=2),
-    ]
-    amenity_rows = []
-    for shop in amenities["shops"][:2]:
-        d = f"{shop['dist']:.1f} mi" if shop.get("dist") is not None else ""
-        amenity_rows.append((shop["name"][:32], d, "SHOP", MID_BLUE))
-    for gp in amenities["doctors"][:2]:
-        d = f"{gp['dist']:.1f} mi" if gp.get("dist") is not None else ""
-        amenity_rows.append((gp["name"][:32], d, "GP", GREEN))
-    for pub in amenities["pubs"][:2]:
-        d = f"{pub['dist']:.1f} mi" if pub.get("dist") is not None else ""
-        amenity_rows.append((pub["name"][:32], d, "PUB", AMBER))
-    if amenity_rows:
-        amenities_block.append(_rows_table(amenity_rows, (50*mm, 15*mm, 12*mm)))
-    else:
-        amenities_block.append(Paragraph("No amenity data found nearby.", NOTE))
-    amenities_block.append(Paragraph("Source: OpenStreetMap — verify current trading status locally.", NOTE))
-
-    two_col2 = Table([[schools_block, Spacer(4*mm,1), amenities_block]], colWidths=[91*mm, 4*mm, 85*mm])
-    two_col2.setStyle(TableStyle([
-        ("VALIGN",(0,0),(-1,-1),"TOP"),
-        ("LEFTPADDING",(0,0),(-1,-1),0), ("RIGHTPADDING",(0,0),(-1,-1),0),
-        ("TOPPADDING",(0,0),(-1,-1),0),  ("BOTTOMPADDING",(0,0),(-1,-1),0),
-    ]))
-    story.append(two_col2)
-    story.append(Spacer(1, 3.5*mm))
-
-    # Rail + Soil side by side
-    rail_block = [
-        Paragraph("🚉  Nearest Railway Stations  (National Rail)", SECH),
-        HRFlowable(width="100%", thickness=1.2, color=MID_BLUE, spaceAfter=2),
-    ]
-    if stations:
-        rail_rows = [(name, f"{dist:.1f} miles", "NEAREST" if i==0 else "", TEAL if i==0 else None)
-                     for i, (name, dist) in enumerate(stations)]
-        rail_rows.append(("National Rail", link("www.nationalrail.co.uk"), "", None))
-        rail_block.append(_rows_table(rail_rows, (35*mm, 43*mm, 18*mm)))
-    else:
-        rail_block.append(Paragraph("Station data unavailable — check nationalrail.co.uk", NOTE))
-    rail_block.append(Paragraph("Straight-line distances. Driving distances will be greater.", NOTE))
-
-    soil_block = [
-        Paragraph("🌱  Soil Texture  (BGS UK Soil Observatory)", SECH),
-        HRFlowable(width="100%", thickness=1.2, color=MID_BLUE, spaceAfter=2),
-    ]
     if soil_texture:
         soil_rows = [
-            ("Texture",         soil_texture.get("texture", "N/A"),         "", None),
-            ("Soil Group",      soil_texture.get("soil_group", "N/A"),      "", None),
-            ("Depth",           soil_texture.get("depth", "N/A"),           "", None),
-            ("Calcareous",      soil_texture.get("calcareous", "N/A"),      "", None),
-            ("Parent Material", soil_texture.get("parent_material", "N/A"), "", None),
+            ("Texture",         _sentence_case(soil_texture.get("texture", "N/A")),         "", None),
+            ("Soil Group",      _sentence_case(soil_texture.get("soil_group", "N/A")),      "", None),
+            ("Depth",           _sentence_case(soil_texture.get("depth", "N/A")),           "", None),
+            ("Calcareous",      _sentence_case(soil_texture.get("calcareous", "N/A")),      "", None),
+            ("Parent Material", _sentence_case(soil_texture.get("parent_material", "N/A")), "", None),
         ]
-        soil_block.append(_rows_table(soil_rows, (28*mm, 44*mm, 14*mm)))
     elif soil_data:
-        # Legacy LandIS Soilscapes path — kept in case Cranfield reinstates it
         soil_rows = [
-            ("Classification", soil_data.get("name", "N/A"),                      f"TYPE {soil_data.get('ssid','')}", BROWN),
-            ("Texture",        soil_data.get("texture",  "N/A"),                   "", None),
-            ("Drainage",       soil_data.get("drainage", "N/A"),                   "", None),
-            ("Fertility",      soil_data.get("fertility","N/A"),                   "", None),
-            ("Land Cover",     soil_data.get("landcover","N/A"),                   "", None),
+            ("Classification", soil_data.get("name", "N/A"),      f"TYPE {soil_data.get('ssid','')}", BROWN),
+            ("Texture",        soil_data.get("texture",  "N/A"),  "", None),
+            ("Drainage",       soil_data.get("drainage", "N/A"),  "", None),
+            ("Fertility",      soil_data.get("fertility","N/A"),  "", None),
+            ("Land Cover",     soil_data.get("landcover","N/A"),  "", None),
         ]
-        soil_block.append(_rows_table(soil_rows, (28*mm, 44*mm, 14*mm)))
     else:
-        soil_block.append(Paragraph("Soil texture data unavailable for this location.", NOTE))
-    soil_block.append(Paragraph("Source: BGS UK Soil Observatory, 1:50,000 Parent Material Model.", NOTE))
+        soil_rows = [("Status", "Soil texture data unavailable for this location.", "", None)]
+    _section(story, "", "Soil Texture  (BGS UK Soil Observatory)", soil_rows,
+             note="BGS UK Soil Observatory, 1:50,000 Parent Material Model.")
 
-    two_col3 = Table([[rail_block, Spacer(4*mm,1), soil_block]], colWidths=[96*mm, 4*mm, 80*mm])
-    two_col3.setStyle(TableStyle([
-        ("VALIGN",(0,0),(-1,-1),"TOP"),
-        ("LEFTPADDING",(0,0),(-1,-1),0), ("RIGHTPADDING",(0,0),(-1,-1),0),
-        ("TOPPADDING",(0,0),(-1,-1),0),  ("BOTTOMPADDING",(0,0),(-1,-1),0),
-    ]))
-    story.append(two_col3)
-    story.append(Spacer(1, 4*mm))
-
-    # Bedrock & Superficial Geology
     bedrock     = geology.get("bedrock")
     superficial = geology.get("superficial")
     geo_rows = []
     if bedrock:
-        type_suffix = f", {bedrock['type']}" if bedrock.get("type") else ""
-        geo_rows.append((
-            "Bedrock",
-            f"{bedrock.get('lithology','N/A')} — {bedrock.get('age','N/A')} ({bedrock.get('period','N/A')}{type_suffix})",
-            "", None,
-        ))
+        type_suffix = f", {bedrock['type'].lower()}" if bedrock.get("type") else ""
+        geo_rows.append(("Bedrock",
+                         f"{bedrock.get('lithology','N/A')} — {bedrock.get('age','N/A')} "
+                         f"({bedrock.get('period','N/A')}{type_suffix})", "", None))
     else:
         geo_rows.append(("Bedrock", "No bedrock record found at this location", "", None))
-    if superficial:
-        geo_rows.append((
-            "Superficial Deposits",
-            f"{superficial.get('lithology','N/A')} — {superficial.get('age','N/A')}",
-            "", None,
-        ))
+    if superficial and (superficial.get("lithology") or "").strip():
+        geo_rows.append(("Superficial Deposits",
+                         f"{superficial.get('lithology')} — {superficial.get('age','N/A')}", "", None))
     else:
         geo_rows.append(("Superficial Deposits", "None recorded — bedrock at or near surface", "", None))
-    clay_verdict, clay_reason = assess_clay_soil(geology, soil_texture)
-    clay_badge_color = {"YES": RED, "NO": GREEN, "UNKNOWN": colors.HexColor("#888888")}[clay_verdict]
+    clay_badge_color = {"YES": RED, "NO": OK_GREEN, "UNKNOWN": NEUTRAL}[clay_verdict]
     geo_rows.append(("Clay Soil Indicator", clay_reason, clay_verdict, clay_badge_color))
-    geo_rows.append(("BGS Geology Viewer", link("https://www.bgs.ac.uk/map-viewers/bgs-geology-viewer/", "View on BGS Geology Viewer"), "", None))
-    _section(story, "🪨", "Bedrock & Superficial Geology  (British Geological Survey)", geo_rows,
+    geo_rows.append(("BGS Geology Viewer", link("https://www.bgs.ac.uk/map-viewers/bgs-geology-viewer/",
+                                                "View on BGS Geology Viewer"), "", None))
+    _section(story, "", "Bedrock & Superficial Geology  (British Geological Survey)", geo_rows,
              note="Bedrock/superficial data is 1:625,000 scale (regional, not site-specific). The Clay Soil "
-                  "Indicator uses the finer 1:50,000 UKSO soil texture data above when available (falling back "
-                  "to this coarser dataset only if that lookup fails) — even so, for foundation-critical "
-                  "decisions a site-specific trial pit or geotechnical survey is still recommended. "
-                  "Distinct from the soil texture classification above, which covers agricultural/drainage "
-                  "soil type rather than underlying geology.",
-             col_widths=(40*mm, 98*mm, 20*mm))
-    story.append(Spacer(1, 2*mm))
+                  "Indicator uses the finer 1:50,000 soil texture data above where available. For "
+                  "foundation-critical decisions a site-specific trial pit or geotechnical survey is recommended.")
+
+    # ══ 5. SALES HISTORY (last) ════════════════════════════════════════════════
+    _part(story, 5, "Sales History")
+    rm_link_text = postcode.replace(" ", "-").lower()
+    sales_block = _heading("Recorded Sales  (HM Land Registry)")
+    if sales:
+        srows = [[Paragraph(f"<b>{s['address']}</b>", VAL),
+                  Paragraph(f"<b>{s['price']}</b>", S("SP", fontSize=9, textColor=INK, fontName="Helvetica-Bold", alignment=2)),
+                  Paragraph(s["date"], VAL), Paragraph(s["type"], VAL), Paragraph(s["tenure"], VAL)]
+                 for s in sales]
+        sales_block.append(_data_table(["Address", "Price", "Date", "Type", "Tenure"], srows,
+                                       [64*mm, 26*mm, 26*mm, 38*mm, 26*mm], align_right_cols=(1,)))
+    else:
+        sales_block.append(Paragraph("No recorded sales found for this property — it may not have changed hands "
+                                     "since 1995, or the address may be recorded differently.", VAL))
+    sales_block.append(Spacer(1, 1.2*mm))
+    sales_block.append(Paragraph(
+        f'Source: {sales_source}. Full street history: '
+        f'{link(rm_url, f"rightmove.co.uk/house-prices/{rm_link_text}.html")}', NOTE))
+    story.append(KeepTogether(sales_block))
+    story.append(Spacer(1, 7*mm))
 
     # Disclaimer
-    story.append(HRFlowable(width="100%", thickness=0.4, color=colors.HexColor("#CCCCCC"), spaceAfter=2))
-    story.append(Paragraph(
-        "<b>Disclaimer:</b> This report is indicative only and generated from publicly available data sources "
-        "(Environment Agency, UKHSA, Cranfield University, Ofsted, National Rail, Rightmove / HM Land Registry, "
-        f"Gov.uk EPC Register). It does not constitute a formal environmental search. "
-        f"Data correct as at {today}.", DISC))
+    disc = Table([[Paragraph(
+        "<b>Disclaimer.</b> This report is indicative only and has been compiled from publicly available data "
+        "sources (Gov.uk EPC Register, OpenStreetMap, Ofsted, National Rail, Historic England, Planning Data, "
+        "Environment Agency, UKHSA, Mining Remediation Authority, British Geological Survey and HM Land Registry). "
+        f"It does not constitute a formal environmental search. Data correct as at {today}.", DISC)]],
+        colWidths=[W], cornerRadii=[3, 3, 3, 3])
+    disc.setStyle(TableStyle([
+        ("BACKGROUND",  (0,0),(-1,-1), LABEL_BG),
+        ("LEFTPADDING", (0,0),(-1,-1), 4*mm), ("RIGHTPADDING", (0,0),(-1,-1), 4*mm),
+        ("TOPPADDING",  (0,0),(-1,-1), 3*mm), ("BOTTOMPADDING", (0,0),(-1,-1), 3*mm),
+    ]))
+    story.append(disc)
 
-    doc.build(story)
+    doc.build(story, canvasmaker=_footer_canvas(
+        f"CWH Surveyors LLP  ·  Property Environmental Report  ·  {address}, {postcode}"))
     print(f"  PDF saved: {output_path}")
     return output_path
 
