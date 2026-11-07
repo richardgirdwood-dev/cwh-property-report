@@ -315,12 +315,61 @@ _PPD_TENURES = {"F": "Freehold", "L": "Leasehold"}
 def _norm_words(text):
     return " " + re.sub(r"[^A-Z0-9 ]", " ", (text or "").upper()).replace("  ", " ") + " "
 
+def _match_subject_sales(rows, address):
+    """Pick the subject property's sales out of a postcode's Price Paid rows.
+    Works for both the Land Registry CSV and the property-shared API, whose
+    rows are normalised to keys: paon, saon, street, price, date (YYYY-MM-DD),
+    property_type, estate_type, new_build (bool), transaction_category.
+    Land Registry stores a flat's number in SAON (e.g. "93") and the building
+    in PAON (e.g. "THE ASH BUILDING"), so both must appear in the address."""
+    addr = _norm_words(address)
+    sales, seen = [], set()
+    for row in rows:
+        if row.get("transaction_category") == "D":   # deleted/corrected records
+            continue
+        paon = _norm_words(row.get("paon")).strip()
+        saon = _norm_words(row.get("saon")).strip()
+        saon_core = re.sub(r"^(FLAT|APARTMENT|UNIT|APT)\s+", "", saon)
+        if not paon or f" {paon} " not in addr:
+            continue
+        if saon and f" {saon_core} " not in addr:
+            continue
+        key = (row.get("date"), str(row.get("price")))
+        if key in seen:
+            continue
+        seen.add(key)
+        parts = [p.title() for p in (row.get("saon"), row.get("paon")) if p]
+        street = (row.get("street") or "").title()
+        # "197 High Street" for a numbered house; "93 The Ash Building, Rudduck Way" for a named building
+        paon_txt = (row.get("paon") or "").strip()
+        sep = " " if re.match(r"^\d+[A-Z]?(-\d+[A-Z]?)?$", paon_txt) else ", "
+        label = " ".join(parts) + (f"{sep}{street}" if street else "")
+        try:
+            d = datetime.strptime(str(row["date"])[:10], "%Y-%m-%d")
+            date_txt = d.strftime("%d %b %Y").lstrip("0")
+        except Exception:
+            d, date_txt = None, str(row.get("date", ""))
+        try:
+            price_txt = f"£{int(row['price']):,}"
+        except Exception:
+            price_txt = str(row.get("price", ""))
+        sales.append({
+            "address":   label,
+            "date":      date_txt,
+            "price":     price_txt,
+            "type":      _PPD_TYPES.get(row.get("property_type"), "") +
+                         (" (new build)" if row.get("new_build") else ""),
+            "type_code": row.get("property_type"),
+            "tenure":    _PPD_TENURES.get(row.get("estate_type"), ""),
+            "_sort":     d or datetime.min,
+        })
+    sales.sort(key=lambda s: s["_sort"], reverse=True)
+    return sales
+
 def fetch_land_registry_sales(postcode, address):
     """Sold prices for the subject property from HM Land Registry Price Paid
     Data (official, free CSV endpoint). Much more reliable than scraping
-    Rightmove, and handles flats properly: Land Registry stores a flat's
-    number in SAON (e.g. "93") and the building in PAON (e.g. "THE ASH
-    BUILDING"), so both must appear in the address for a match."""
+    Rightmove. Returns None if the service could not be reached."""
     url = (f"https://landregistry.data.gov.uk/app/ppd/ppd_data.csv"
            f"?postcode={postcode.replace(' ', '+')}&header=true&limit=all")
     try:
@@ -328,46 +377,120 @@ def fetch_land_registry_sales(postcode, address):
         r = requests.get(url, timeout=30, headers=HEADERS)
         if r.status_code != 200:
             return None
-        addr = _norm_words(address)
-        sales = []
-        for row in csv.DictReader(io.StringIO(r.text)):
-            if row.get("transaction_category") == "D":   # deleted/corrected records
-                continue
-            paon = _norm_words(row.get("paon")).strip()
-            saon = _norm_words(row.get("saon")).strip()
-            saon_core = re.sub(r"^(FLAT|APARTMENT|UNIT|APT)\s+", "", saon)
-            if not paon or f" {paon} " not in addr:
-                continue
-            if saon and f" {saon_core} " not in addr:
-                continue
-            parts = [p.title() for p in (row.get("saon"), row.get("paon")) if p]
-            street = (row.get("street") or "").title()
-            # "197 High Street" for a numbered house; "93 The Ash Building, Rudduck Way" for a named building
-            paon_txt = (row.get("paon") or "").strip()
-            sep = " " if re.match(r"^\d+[A-Z]?(-\d+[A-Z]?)?$", paon_txt) else ", "
-            label = " ".join(parts) + (f"{sep}{street}" if street else "")
-            try:
-                d = datetime.strptime(row["deed_date"][:10], "%Y-%m-%d")
-                date_txt = d.strftime("%d %b %Y").lstrip("0")
-            except Exception:
-                d, date_txt = None, row.get("deed_date", "")
-            try:
-                price_txt = f"£{int(row['price_paid']):,}"
-            except Exception:
-                price_txt = row.get("price_paid", "")
-            sales.append({
-                "address": label,
-                "date":    date_txt,
-                "price":   price_txt,
-                "type":    _PPD_TYPES.get(row.get("property_type"), "") +
-                           (" (new build)" if row.get("new_build") == "Y" else ""),
-                "tenure":  _PPD_TENURES.get(row.get("estate_type"), ""),
-                "_sort":   d or datetime.min,
-            })
-        sales.sort(key=lambda s: s["_sort"], reverse=True)
-        return sales
+        rows = [{
+            "paon": row.get("paon"), "saon": row.get("saon"), "street": row.get("street"),
+            "price": row.get("price_paid"), "date": row.get("deed_date"),
+            "property_type": row.get("property_type"), "estate_type": row.get("estate_type"),
+            "new_build": row.get("new_build") == "Y",
+            "transaction_category": row.get("transaction_category"),
+        } for row in csv.DictReader(io.StringIO(r.text))]
+        return _match_subject_sales(rows, address)
     except Exception:
         return None
+
+# ── UK property connector (open-source property-shared API) ───────────────────
+# The same open-source "UK property" connector Richard uses in Claude
+# (github: paulieb89/property-shared, MIT licence), called over its public
+# REST API — no key required. Supplies comparable sales (with EPC floor area /
+# price per sq ft), rental listings and a Price Paid backup source.
+PROPERTY_API = "https://property-shared.fly.dev"
+
+def _property_api(path, **params):
+    try:
+        r = requests.get(PROPERTY_API + path, timeout=45, headers=HEADERS,
+                         params={k: v for k, v in params.items() if v is not None})
+        return r.json() if r.status_code == 200 else None
+    except Exception:
+        return None
+
+def fetch_connector_sales(postcode, address):
+    """Backup source for the subject's sales: the connector's Price Paid
+    snapshot for the postcode, matched with the same rules as above."""
+    data = _property_api("/v1/ppd/transactions", postcode=postcode, limit=200)
+    if not data:
+        return None
+    return _match_subject_sales(data.get("results", []), address)
+
+def _ppd_type_code(epc_prop_type, sales):
+    """F/D/S/T for the subject, from its own Land Registry record if there is
+    one, otherwise from the EPC property type text (e.g. 'Mid-terrace house')."""
+    if sales and sales[0].get("type_code") in ("F", "D", "S", "T"):
+        return sales[0]["type_code"]
+    t = (epc_prop_type or "").lower()
+    if "flat" in t or "maisonette" in t:
+        return "F"
+    if "semi" in t:
+        return "S"
+    if "terrace" in t:
+        return "T"
+    if "detached" in t:
+        return "D"
+    return None
+
+def fetch_local_market(postcode, type_code):
+    """Local market context from the connector: comparable sales of the same
+    property type over the last 24 months (postcode sector, widening to the
+    district if fewer than 3), EPC-matched price per sq ft, and Rightmove
+    rental listings nearby. Returns None if the connector is unreachable."""
+    level = "sector"
+    comps = _property_api("/v1/ppd/comps", postcode=postcode, property_type=type_code, months=24,
+                          limit=200, enrich_epc="true", search_level=level)
+    if comps is not None and (comps.get("count") or 0) < 3:
+        wider = _property_api("/v1/ppd/comps", postcode=postcode, property_type=type_code, months=24,
+                              limit=200, enrich_epc="true", search_level="district")
+        if wider and (wider.get("count") or 0) > (comps.get("count") or 0):
+            comps, level = wider, "district"
+    rental = _property_api("/v1/analysis/rental", postcode=postcode, building_type=type_code)
+    if comps is None and rental is None:
+        return None
+
+    out = {"level": level, "type_code": type_code, "comps": [], "count": 0}
+    if comps:
+        out.update({
+            "count":       comps.get("count") or 0,
+            "median":      comps.get("median"),
+            "p25":         comps.get("percentile_25"),
+            "p75":         comps.get("percentile_75"),
+            "median_ppsf": comps.get("median_price_per_sqft"),
+            "coverage_to": (comps.get("provenance") or {}).get("coverage_to"),
+        })
+        for t in comps.get("transactions", []):
+            epc_m = t.get("epc_match") or {}
+            area_sqm = epc_m.get("floor_area") or t.get("epc_floor_area_sqm")
+            parts = [p.title() for p in (t.get("saon"), t.get("paon")) if p]
+            paon_txt = (t.get("paon") or "").strip()
+            sep = " " if re.match(r"^\d+[A-Z]?$", paon_txt) else ", "
+            street = (t.get("street") or "").title()
+            try:
+                date_txt = datetime.strptime(t["date"][:10], "%Y-%m-%d").strftime("%b %Y")
+            except Exception:
+                date_txt = t.get("date", "")
+            price = t.get("price")
+            out["comps"].append({
+                "address": " ".join(parts) + (f"{sep}{street}" if street else ""),
+                "postcode": t.get("postcode", ""),
+                "date":    date_txt,
+                "price":   price,
+                "sqft":    round(area_sqm * 10.7639) if area_sqm else None,
+                "ppsf":    t.get("price_per_sqft") or (round(price / (area_sqm * 10.7639))
+                                                       if price and area_sqm else None),
+                "rating":  epc_m.get("rating") or t.get("epc_rating"),
+            })
+        # Show the 6 most recent comparables, preferring ones matched to an EPC
+        # (so floor area and price per sq ft are available) when there are enough.
+        with_area = [c for c in out["comps"] if c["sqft"]]
+        out["comps"] = (with_area if len(with_area) >= 4 else out["comps"])[:6]
+    if rental and rental.get("median_rent_monthly"):
+        out.update({
+            "rent_median": rental.get("median_rent_monthly"),
+            "rent_low":    rental.get("rent_range_low"),
+            "rent_high":   rental.get("rent_range_high"),
+            "rent_count":  rental.get("rental_listings_count"),
+            "rent_radius": rental.get("search_radius_miles"),
+        })
+    if out.get("rent_median") and out.get("median"):
+        out["gross_yield"] = round(out["rent_median"] * 12 / out["median"] * 100, 1)
+    return out
 
 def fetch_sales_history(postcode, house_number):
     """Scrapes Rightmove for the subject property's sale(s).
@@ -1056,6 +1179,10 @@ def generate_report(address, postcode, output_path):
         lr = fetch_land_registry_sales(postcode, address)
         if lr:
             return lr, "HM Land Registry Price Paid Data", rm
+        if lr is None:   # Land Registry unreachable — try the property connector's copy
+            cs = fetch_connector_sales(postcode, address)
+            if cs:
+                return cs, "HM Land Registry Price Paid Data (via property-shared)", rm
         rm_sales, rm = fetch_sales_history(postcode, house_number)
         return rm_sales, ("Rightmove" if rm_sales else "HM Land Registry Price Paid Data"), rm
 
@@ -1084,6 +1211,9 @@ def generate_report(address, postcode, output_path):
         radon_desc, (radon_hex, radon_badge) = f_radon.result()
 
     clay_verdict, clay_reason = assess_clay_soil(geology, soil_texture)
+    # Local market needs the property type (from the sale record or EPC), so it runs second
+    type_code = _ppd_type_code(epc.get("prop_type") if epc else None, sales)
+    market    = fetch_local_market(postcode, type_code)
     print(f"  Data fetched. Building PDF...")
 
     # ── Build PDF ──────────────────────────────────────────────────────────────
@@ -1414,7 +1544,7 @@ def generate_report(address, postcode, output_path):
                   "foundation-critical decisions a site-specific trial pit or geotechnical survey is recommended.")
 
     # ══ 5. SALES HISTORY (last) ════════════════════════════════════════════════
-    _part(story, 5, "Sales History")
+    _part(story, 5, "Sales History & Local Market")
     rm_link_text = postcode.replace(" ", "-").lower()
     sales_block = _heading("Recorded Sales  (HM Land Registry)")
     if sales:
@@ -1432,14 +1562,91 @@ def generate_report(address, postcode, output_path):
         f'Source: {sales_source}. Full street history: '
         f'{link(rm_url, f"rightmove.co.uk/house-prices/{rm_link_text}.html")}', NOTE))
     story.append(KeepTogether(sales_block))
+    story.append(Spacer(1, 5*mm))
+
+    # Local market — from the open-source UK property connector (property-shared)
+    type_word = {"F": "flat", "D": "detached house", "S": "semi-detached house",
+                 "T": "terraced house"}.get(type_code, "residential")
+    pc_parts = postcode.split()
+    if market and market.get("level") == "sector" and len(pc_parts) == 2:
+        area_label = f"the {pc_parts[0]} {pc_parts[1][0]} postcode sector"
+    else:
+        area_label = f"the {pc_parts[0]} postcode district"
+    mkt_block = _heading("Local Market  (UK property connector)")
+    mkt_note = None
+    if market and (market.get("count") or market.get("rent_median")):
+        def gbp(v):
+            return f"£{int(v):,}" if v else "—"
+        mrows = []
+        if market.get("count"):
+            n = market["count"]
+            mrows.append(("Comparable Sales",
+                          f"{n} {type_word} sale{'s' if n != 1 else ''} in {area_label} in the last 24 months",
+                          "", None))
+            mrows.append(("Median Sale Price",
+                          f"<b>{gbp(market.get('median'))}</b>  (middle half {gbp(market.get('p25'))} – "
+                          f"{gbp(market.get('p75'))})", "", None))
+            if market.get("median_ppsf"):
+                mrows.append(("Median Price / sq ft",
+                              f"<b>£{int(market['median_ppsf']):,}</b> per sq ft  (floor areas from EPC records)",
+                              "", None))
+        if market.get("rent_median"):
+            listing_word = f"{type_word} listings" if type_code else "listings"
+            mrows.append(("Median Asking Rent",
+                          f"<b>{gbp(market['rent_median'])} pcm</b>  (range {gbp(market.get('rent_low'))} – "
+                          f"{gbp(market.get('rent_high'))}; {market.get('rent_count', 0)} {listing_word} "
+                          f"within {market.get('rent_radius', 0.5):g} miles)", "", None))
+        if market.get("gross_yield"):
+            mrows.append(("Indicative Gross Yield",
+                          f"{market['gross_yield']:.1f}%  (median rent × 12 ÷ median sale price)", "", None))
+        mkt_block.append(_rows_table(mrows))
+        if market.get("comps"):
+            mkt_block.append(Spacer(1, 3*mm))
+            crow = []
+            for c in market["comps"]:
+                crow.append([
+                    Paragraph(f"{c['address']}, <font size='7.5' color='#6B7280'>{c['postcode']}</font>", VAL),
+                    Paragraph(c["date"], VAL),
+                    Paragraph(f"<b>{gbp(c['price'])}</b>",
+                              S("CP", fontSize=9, textColor=INK, fontName="Helvetica-Bold", alignment=2)),
+                    Paragraph(f"{c['sqft']:,} sq ft" if c.get("sqft") else "—",
+                              S("CA", fontSize=9, textColor=INK, alignment=2)),
+                    Paragraph(f"£{int(c['ppsf']):,}" if c.get("ppsf") else "—",
+                              S("CF", fontSize=9, textColor=INK, alignment=2)),
+                    Paragraph(c.get("rating") or "—", S("CR", fontSize=9, textColor=INK, alignment=1)),
+                ])
+            mkt_block.append(_data_table(
+                ["Recent comparable", "Sold", "Price", "Floor area", "£ / sq ft", "EPC"], crow,
+                [70*mm, 22*mm, 26*mm, 24*mm, 22*mm, 16*mm], align_right_cols=(2, 3, 4)))
+        cov = market.get("coverage_to")
+        try:
+            cov_txt = datetime.strptime(cov, "%Y-%m-%d").strftime("%B %Y") if cov else None
+        except Exception:
+            cov_txt = cov
+        mkt_note = ("Market context only — not a valuation. Comparable sales are standard-price Land Registry "
+                    "transactions" + (f" recorded up to {cov_txt}" if cov_txt else "") +
+                    "; recent months are provisional. " +
+                    ("Rents are current Rightmove asking rents. " if market.get("rent_median") else
+                     "Rent is omitted where there were too few listings of this property type nearby. ") +
+                    f"Source: open-source property-shared API ({link(PROPERTY_API, 'property-shared.fly.dev')}).")
+    else:
+        mkt_block.append(Paragraph("Local market data temporarily unavailable — the property data connector did "
+                                   "not respond. Re-run the report to include it.", VAL))
+    if mkt_note:
+        mkt_block.append(Spacer(1, 1.2*mm))
+        mkt_block.append(Paragraph(mkt_note, NOTE))
+    story.append(CondPageBreak(70*mm))
+    story.extend(mkt_block)
     story.append(Spacer(1, 7*mm))
 
     # Disclaimer
     disc = Table([[Paragraph(
         "<b>Disclaimer.</b> This report is indicative only and has been compiled from publicly available data "
         "sources (Gov.uk EPC Register, OpenStreetMap, Ofsted, National Rail, Historic England, Planning Data, "
-        "Environment Agency, UKHSA, Mining Remediation Authority, British Geological Survey and HM Land Registry). "
-        f"It does not constitute a formal environmental search. Data correct as at {today}.", DISC)]],
+        "Environment Agency, UKHSA, Mining Remediation Authority, British Geological Survey, HM Land Registry and "
+        "Rightmove, with market data via the open-source property-shared API). It does not constitute a formal "
+        f"environmental search or a valuation. Data correct as at {today}. Contains HM Land Registry data © Crown "
+        "copyright and database right, licensed under the Open Government Licence v3.0.", DISC)]],
         colWidths=[W], cornerRadii=[3, 3, 3, 3])
     disc.setStyle(TableStyle([
         ("BACKGROUND",  (0,0),(-1,-1), LABEL_BG),
